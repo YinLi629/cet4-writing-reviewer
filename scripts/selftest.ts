@@ -8,7 +8,9 @@
 import { getAccessCode, hasAccessCode, verifyAccessCode } from "../lib/access";
 import { locateQuote, attachLocations } from "../lib/evidence";
 import { segmentEssay } from "../lib/highlight";
+import { scanJsonPrefix, type ScanResult, type ScannedMember } from "../lib/json-stream";
 import { METHOD_LABEL } from "../lib/labels";
+import { MAX_EVIDENCE } from "../lib/prompt";
 import { clientKeyFrom, configFromEnv, createRateLimiter } from "../lib/rate-limit";
 import { buildReportHtml, escapeHtml, renderHighlightedEssay } from "../lib/report-html";
 import { MAX_BODY_BYTES, readJsonBody } from "../lib/request-body";
@@ -24,9 +26,16 @@ import {
   tierGapFor,
   type CeilingContext,
 } from "../lib/rubric";
-import { __internals, normalizeInput, reviewEssay } from "../lib/review";
+import { __internals, normalizeInput, reviewEssay, reviewEssayStream } from "../lib/review";
+import { createSseFrameParser, encodeSseFrame, SSE_RESPONSE_HEADERS } from "../lib/sse";
 import { computeStats } from "../lib/text-stats";
-import { MAX_ESSAY_CHARS, MAX_QUOTE_CHARS, MAX_TOPIC_CHARS, type ReviewResult } from "../lib/types";
+import {
+  MAX_ESSAY_CHARS,
+  MAX_QUOTE_CHARS,
+  MAX_TOPIC_CHARS,
+  type ReviewResult,
+  type ReviewStreamEvent,
+} from "../lib/types";
 
 let passed = 0;
 let failed = 0;
@@ -893,6 +902,569 @@ async function runAbortTest() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// [14] 增量 JSON 扫描
+//
+// 扫描器只负责展示、不承担正确性（最终结果永远由 extractJson 解析累积全文，
+// 见 lib/json-stream.ts 头部）。但它有一条比"展示得对不对"更重要的性质，
+// 也是这一节花最多篇幅去测的：**缓冲只增不减，所以扫描结果必须单调**——
+// 已产出的成员不能消失、值也不能变。一旦变了，等待界面上就会出现
+// "这段文字已经显示出来了，几秒后自己改了口"。
+//
+// 逐前缀扫一遍是抓这类 bug 最直接的打法：任何边界错误都会在某个 n 上暴露出来，
+// 而且不需要猜边界在哪。
+function runJsonStreamTests(): void {
+  console.log("\n[14] 增量 JSON 扫描");
+
+  /** 喂进全部 doc.length + 1 个前缀，断言已产出的部分只增不改，返回最后一次的结果 */
+  function feedAllPrefixes(label: string, doc: string): ScanResult {
+    let prevMembers: ScannedMember[] = [];
+    let prevEvidence: unknown[] = [];
+    let broke = "";
+
+    for (let n = 0; n <= doc.length; n += 1) {
+      const scan = scanJsonPrefix(doc.slice(0, n));
+
+      if (scan.members.length < prevMembers.length) {
+        broke = `n=${n}：成员数从 ${prevMembers.length} 掉到 ${scan.members.length}`;
+      }
+      for (let i = 0; !broke && i < prevMembers.length; i += 1) {
+        if (JSON.stringify(scan.members[i]) !== JSON.stringify(prevMembers[i])) {
+          broke = `n=${n}：第 ${i} 个成员变了，${JSON.stringify(prevMembers[i])} → ${JSON.stringify(scan.members[i])}`;
+        }
+      }
+      if (scan.evidence.length < prevEvidence.length) {
+        broke = `n=${n}：证据数从 ${prevEvidence.length} 掉到 ${scan.evidence.length}`;
+      }
+      for (let i = 0; !broke && i < prevEvidence.length; i += 1) {
+        if (JSON.stringify(scan.evidence[i]) !== JSON.stringify(prevEvidence[i])) {
+          broke = `n=${n}：第 ${i} 条证据变了`;
+        }
+      }
+      if (broke) break;
+
+      prevMembers = scan.members;
+      prevEvidence = scan.evidence;
+    }
+
+    check(`${label}：每一个前缀都单调（${doc.length + 1} 次扫描）`, broke === "", broke);
+    return { members: prevMembers, evidence: prevEvidence };
+  }
+
+  // 一份把各种"会让朴素扫描器翻车"的东西都塞进去的文档：
+  // 字符串里的花括号、转义引号、反斜杠、换行、emoji（代理对）、中文
+  const TRICKY_VALUE = '他说："这里有 { 花括号 }、反斜杠 \\ 和 emoji 🎉"，还有换行\n第二行';
+  const doc = JSON.stringify({
+    score15: 8,
+    summary: TRICKY_VALUE,
+    strengths: ["主题明确", '含引号"的片段'],
+    dimensionScores: [
+      { dimension: "content", score: 3, comment: "基本切题" },
+      { dimension: "language", score: 2, comment: "主谓不一致" },
+      { dimension: "organization", score: 3, comment: "有基本结构" },
+    ],
+    evidence: [
+      { dimension: "language", kind: "major", quote: "I very like help", comment: "主谓不一致" },
+      {
+        dimension: "content",
+        kind: "strength",
+        quote: "Last year I join",
+        comment: "有具体经历",
+        suggestion: "改成 joined",
+      },
+    ],
+    upgradePlan: [{ priority: 1, dimension: "language", action: "先修主谓一致", rationale: "r" }],
+  });
+
+  const scanned = feedAllPrefixes("含转义/花括号/emoji 的文档", doc);
+  eq(
+    "顶层成员按出现顺序全部扫出",
+    scanned.members.map((m) => m.key),
+    ["score15", "summary", "strengths", "dimensionScores", "evidence", "upgradePlan"],
+  );
+  eq("含转义、换行与 emoji 的值原样还原", scanned.members[1]?.value, TRICKY_VALUE);
+  eq("evidence 逐条扫出", scanned.evidence.length, 2);
+  eq(
+    "evidence 元素内容完整（含可选字段 suggestion）",
+    (scanned.evidence[1] as { suggestion?: string })?.suggestion,
+    "改成 joined",
+  );
+
+  // 20 条证据的文档也扫一遍前缀，确认规模上来之后单调性仍然成立
+  const many = JSON.stringify({
+    evidence: Array.from({ length: 20 }, (_, i) => ({ quote: `q${i}`, kind: "minor" })),
+  });
+  eq("20 条证据全部扫出", feedAllPrefixes("20 条证据", many).evidence.length, 20);
+
+  // 分隔符规则：不遇到分隔符就不产出。这是刻意的——否则界面上会出现一个
+  // 还在生长、每来一个字就重排一次的字符串
+  eq("没遇到分隔符就不产出", scanJsonPrefix('{"summary": "abc"').members.length, 0);
+  eq("补上逗号后恰好产出一遍", scanJsonPrefix('{"summary": "abc",').members, [
+    { key: "summary", value: "abc" },
+  ]);
+  eq("最后一个成员靠外层 } 收尾", scanJsonPrefix('{"summary": "abc"}').members, [
+    { key: "summary", value: "abc" },
+  ]);
+
+  // 逐个点名的切点（前缀扫描已经全覆盖，这几条是为了让意图留在测试里）
+  eq("切在键名中间：不产出", scanJsonPrefix('{"summ').members.length, 0);
+  eq("切在键与冒号之间：不产出", scanJsonPrefix('{"summary"').members.length, 0);
+  eq("切在冒号与值之间：不产出", scanJsonPrefix('{"summary":').members.length, 0);
+  eq("切在数字中间：不产出", scanJsonPrefix('{"a": 12').members.length, 0);
+  eq("切在字符串内的转义符之后：不产出", scanJsonPrefix('{"a": "x\\').members.length, 0);
+  eq("切在代理对中间：不产出（emoji 也不能把它劈坏）", scanJsonPrefix('{"a": "🎉'.slice(0, 8)).members.length, 0);
+  eq("值写完后立刻产出（等到 } ）", scanJsonPrefix('{"a": 1}').members.length, 1);
+
+  // 重复键：只认第一个 evidence 数组，否则渐进视图会推出最终 JSON.parse 会丢掉的条目
+  eq(
+    "重复的 evidence 键只认第一个",
+    scanJsonPrefix('{"evidence":[{"q":1}],"other":[{"q":2}],"evidence":[{"q":3}]}').evidence,
+    [{ q: 1 }],
+  );
+  // 证据项里的 example: {before, after} 是第 4 层，不能被当成又一条证据
+  eq(
+    "证据项里的嵌套对象不会被当成又一条证据",
+    scanJsonPrefix('{"evidence":[{"quote":"q","example":{"before":"a","after":"b"}}]}').evidence.length,
+    1,
+  );
+
+  // 截断：只可能少报，绝不抛
+  eq("截断的 evidence 项不产出", scanJsonPrefix('{"evidence":[{"quote":"abc","comment":"还没写完').evidence, []);
+  eq(
+    "截断的数组不影响前面已经写完的成员",
+    scanJsonPrefix('{"summary": "abc", "strengths": ["a", "b').members.length,
+    1,
+  );
+
+  // 深度炸弹：正常输出只有 4-5 层，超过上限直接放弃扫描，但不能爆栈
+  const bomb = '{"a":' + "[".repeat(200) + "1" + "]".repeat(200) + "}";
+  eq("超深嵌套直接放弃（只可能少报）", scanJsonPrefix(bomb).members.length, 0);
+
+  // 散文前缀：模型偶尔会在 JSON 前面写一句客套话，里面的花括号不能把人骗过去
+  eq(
+    "散文里的假花括号不会骗到扫描器",
+    scanJsonPrefix('好的，结果如下（JSON 格式）：{不是对象}，真正的对象在下面：{"a": 1}').members,
+    [{ key: "a", value: 1 }],
+  );
+
+  // "绝不抛"是调用方能 try/catch 它的前提。这里把各种半截结构都试一遍
+  for (const weird of ["", "{", '"', "\\", "{\"", '{"a', '{"a"', "{]", "[}", '{"a": }', "{{{", "｛\"a\":1｝", '{"a":1}}']) {
+    let threw = false;
+    try {
+      scanJsonPrefix(weird);
+    } catch {
+      threw = true;
+    }
+    check(`怪输入不抛异常：${JSON.stringify(weird)}`, !threw);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// [15] SSE 分帧
+function runSseTests(): void {
+  console.log("\n[15] SSE 分帧");
+
+  const encoded = encodeSseFrame("meta", { type: "meta", chars: 3 });
+  eq("编码格式", encoded, 'event: meta\ndata: {"type":"meta","chars":3}\n\n');
+
+  const parsed = createSseFrameParser().push(encoded);
+  eq("一帧", parsed.length, 1);
+  eq("事件名", parsed[0]?.event, "meta");
+  eq("载荷", parsed[0]?.data, { type: "meta", chars: 3 });
+
+  // 载荷里的换行会被 JSON.stringify 转义成字面的 \n，所以 data 永远只占一行——
+  // 这是 encodeSseFrame 敢直接拼字符串的前提
+  const multiline = encodeSseFrame("summary", { value: "第一行\n第二行" });
+  eq(
+    "带换行的载荷仍然只占一行 data",
+    multiline.split("\n").filter((l) => l.startsWith("data:")).length,
+    1,
+  );
+  eq(
+    "换行原样还原",
+    (createSseFrameParser().push(multiline)[0]?.data as { value: string }).value,
+    "第一行\n第二行",
+  );
+
+  // **帧被切在两块 chunk 之间**：每一个切点都必须能拼回来。
+  // 这是客户端读取器唯一真正难写对的地方，所以穷举所有切点
+  const payload = { type: "evidence", value: { id: "e1", quote: '含"引号"和\n换行' } };
+  const text = encodeSseFrame("evidence", payload);
+  let badSplits = 0;
+  for (let i = 0; i <= text.length; i += 1) {
+    const p = createSseFrameParser();
+    const got = [...p.push(text.slice(0, i)), ...p.push(text.slice(i))];
+    if (got.length !== 1 || JSON.stringify(got[0].data) !== JSON.stringify(payload)) badSplits += 1;
+  }
+  check(`任意切点都能拼回一帧（${text.length + 1} 个切点）`, badSplits === 0, `${badSplits} 个切点失败`);
+
+  eq(
+    "一块含两帧",
+    createSseFrameParser().push(encodeSseFrame("a", 1) + encodeSseFrame("b", 2)).map((f) => f.event),
+    ["a", "b"],
+  );
+
+  // 这一条盯的是分帧里最容易写错的地方：**不能按块归一化换行**。
+  // 前一块以孤立的 \r 结尾、后一块以 \n 开头，合起来才是空行；
+  // 一旦按块把 \r 规整成 \n，前一块自己就凑出了"空行"，凭空多切一帧
+  const crlfTrap = createSseFrameParser();
+  eq("结尾的孤立 \\r 不算空行", crlfTrap.push("event: a\r\ndata: 1\r\n\r").length, 0);
+  eq("补上 \\n 才成帧（没有凭空多切）", crlfTrap.push("\n").length, 1);
+
+  const lfTrap = createSseFrameParser();
+  eq("结尾的单个 \\n 不算空行", lfTrap.push("event: a\ndata: 1\n").length, 0);
+  eq("再补一个 \\n 才成帧", lfTrap.push("\n").length, 1);
+
+  eq("\\r\\n\\r\\n 也认", createSseFrameParser().push("event: a\r\ndata: 1\r\n\r\n").length, 1);
+
+  const withComment = createSseFrameParser().push(": 心跳注释\nevent: a\ndata: 1\n\n");
+  eq("注释行被忽略", withComment.length, 1);
+  eq("注释不影响事件名", withComment[0]?.event, "a");
+
+  eq("只有注释的块不派发", createSseFrameParser().push(": 只有注释\n\n").length, 0);
+  eq(
+    "多行 data 用换行拼起来",
+    createSseFrameParser().push("event: a\ndata: 第一行\ndata: 第二行\n\n")[0]?.raw,
+    "第一行\n第二行",
+  );
+  // 规范规定冒号后紧跟的**一个**空格要去掉，多出来的属于数据
+  eq(
+    "冒号后只吃掉一个空格",
+    createSseFrameParser().push("data:  1\n\n")[0]?.raw,
+    " 1",
+  );
+
+  // 坏掉的载荷不能静默丢掉：上层要能区分"这一帧坏了"和"流结束了但没有结果"
+  const broken = createSseFrameParser().push("event: a\ndata: {不是 JSON}\n\n");
+  eq("坏载荷仍然交出这一帧", broken.length, 1);
+  eq("坏载荷的 data 是 undefined", broken[0]?.data, undefined);
+  eq("坏载荷保留原文供记日志", broken[0]?.raw, "{不是 JSON}");
+
+  // 承重墙：next 15 默认装的 compression 把 text/event-stream 判成可压缩，
+  // 靠 no-transform 让 shouldTransform() 直接返回 false。这条没了就可能被缓冲
+  eq("Content-Type 是 SSE", SSE_RESPONSE_HEADERS["Content-Type"], "text/event-stream; charset=utf-8");
+  check(
+    "Cache-Control 带 no-transform",
+    (SSE_RESPONSE_HEADERS["Cache-Control"] ?? "").includes("no-transform"),
+    SSE_RESPONSE_HEADERS["Cache-Control"],
+  );
+  check("禁用中间层缓冲", SSE_RESPONSE_HEADERS["X-Accel-Buffering"] === "no");
+}
+
+// ---------------------------------------------------------------------------
+// [16] 流式与非流式平价
+
+/** 造一个 OpenAI 兼容的 SSE 响应体，把 content 切成 chunkSize 大小一片一片吐出去 */
+function sseResponse(
+  content: string,
+  opts: { chunkSize?: number; gapMs?: number; finishReason?: string; signal?: AbortSignal } = {},
+): Response {
+  const size = opts.chunkSize ?? 1;
+  const pieces: string[] = [];
+  for (let i = 0; i < content.length; i += size) pieces.push(content.slice(i, i + size));
+
+  const encoder = new TextEncoder();
+  let stopped = false;
+
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (text: string): void => {
+        if (stopped) return;
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          stopped = true;
+        }
+      };
+
+      // 模拟真实 fetch 的行为：请求信号一断，读端立刻拿到 AbortError。
+      // 自己 new 出来的 Response 不会自动接上信号，必须手动接——
+      // 否则"客户端断开时中止上游"这条在测试里永远是假的绿
+      opts.signal?.addEventListener("abort", () => {
+        if (stopped) return;
+        stopped = true;
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        try {
+          controller.error(err);
+        } catch {
+          // 流已经关了，忽略
+        }
+      });
+
+      for (let i = 0; i < pieces.length; i += 1) {
+        // gapMs 用来模拟"上游卡住了"，让 2 秒一次的心跳有机会发出来
+        if (opts.gapMs && i === pieces.length - 1) {
+          await new Promise((r) => setTimeout(r, opts.gapMs));
+        }
+        if (stopped) return;
+        send(`data: ${JSON.stringify({ choices: [{ delta: { content: pieces[i] } }] })}\n\n`);
+      }
+
+      send(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: opts.finishReason ?? "stop" }] })}\n\n`,
+      );
+      send("data: [DONE]\n\n");
+      if (!stopped) {
+        stopped = true;
+        try {
+          controller.close();
+        } catch {
+          // 忽略
+        }
+      }
+    },
+  });
+
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+async function runStreamParityTests(): Promise<void> {
+  console.log("\n[16] 流式与非流式平价");
+
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "sk-test-key-not-real";
+
+  const ESSAY =
+    "I am a student want to join your volunteer program. I very like help other people. " +
+    "Last year I also join a activity about clean the park.";
+  const TOPIC = "apply for a volunteer program";
+
+  const modelJson = JSON.stringify({
+    score15: 8,
+    summary: "意思能看懂，但语言错误密集。",
+    strengths: ["主题明确", "有具体经历"],
+    // 刻意按 DIMENSIONS 的顺序给，这样"逐个推出去的维度分"与最终数组可以直接比
+    dimensionScores: [
+      { dimension: "content", score: 3, comment: "基本切题" },
+      { dimension: "language", score: 2, comment: "主谓不一致较多" },
+      { dimension: "organization", score: 3, comment: "有基本结构" },
+    ],
+    evidence: [
+      {
+        dimension: "language",
+        kind: "major",
+        quote: "I very like help other people.",
+        comment: "主谓不一致",
+        suggestion: "I like helping others.",
+      },
+      { dimension: "content", kind: "strength", quote: "Last year I also join", comment: "有具体经历" },
+      { dimension: "language", kind: "major", quote: "这句原文里根本没有出现过", comment: "应定位失败" },
+    ],
+    upgradePlan: [
+      {
+        priority: 1,
+        dimension: "language",
+        action: "先修主谓一致",
+        rationale: "r",
+        example: { before: "a student want", after: "a student who wants" },
+      },
+    ],
+  });
+
+  /** 调一次流式批改，只把错误码取出来（照抄 runAbortTest 的写法） */
+  const codeOfStream = async (
+    signal: AbortSignal | undefined,
+    seen?: ReviewStreamEvent[],
+  ): Promise<string> => {
+    try {
+      await reviewEssayStream({ essay: ESSAY, topic: TOPIC }, signal, (e) => seen?.push(e));
+      return "NO_ERROR";
+    } catch (e) {
+      return (e as { code?: string }).code ?? "NOT_AN_LLM_ERROR";
+    }
+  };
+
+  /** filter 的收窄版，省得后面到处写类型断言 */
+  const only = <T extends ReviewStreamEvent["type"]>(list: ReviewStreamEvent[], type: T) =>
+    list.filter((e): e is Extract<ReviewStreamEvent, { type: T }> => e.type === type);
+
+  try {
+    // ① 非流式：一次请求一次返回
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: modelJson } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+    const plain = await reviewEssay({ essay: ESSAY, topic: TOPIC });
+    eq("（前提）非流式路径能跑通", typeof plain.score15, "number");
+
+    // ② 流式：同一份 JSON，切成**一个字符一块**地喂进去。这是最恶毒的切法，
+    //    每个 chunk 边界都落在半帧、半个字符串、甚至代理对中间
+    globalThis.fetch = (async () => sseResponse(modelJson, { chunkSize: 1 })) as typeof fetch;
+    const events: ReviewStreamEvent[] = [];
+    const streamed = await reviewEssayStream({ essay: ESSAY, topic: TOPIC }, undefined, (e) =>
+      events.push(e),
+    );
+
+    // 结果平价。这是唯一能证明"两条路径共用同一套后处理"的测试：
+    // 同一份模型输出，一次走普通响应、一次按对抗性边界切碎，结果必须一模一样
+    const strip = (r: ReviewResult): ReviewResult => ({
+      ...r,
+      meta: { ...r.meta, elapsedMs: 0, createdAt: "" },
+    });
+    eq("流式与非流式结果完全一致（除耗时/时间戳）", strip(streamed), strip(plain));
+
+    // 事件日志必须是最终结果的一个一致投影
+    eq("第一帧是 meta", events[0]?.type, "meta");
+    eq("meta 只出现一次", only(events, "meta").length, 1);
+    eq("最后一帧是 result", events[events.length - 1]?.type, "result");
+
+    const last = events[events.length - 1];
+    check("result 帧带的就是权威结果对象", last.type === "result" && last.result === streamed);
+    eq("没有 error 帧", only(events, "error").length, 0);
+
+    // 三条硬规矩：不发 score15、不发 warnings。分数要等上限校正算完，
+    // 而 warnings 里那条"分数已由系统校正：模型给出 N 分"会把押后的原始分漏出来
+    const premature = events
+      .slice(0, -1)
+      .filter((e) => {
+        const s = JSON.stringify(e);
+        return s.includes("score15") || s.includes("warnings");
+      })
+      .map((e) => e.type);
+    eq("result 之前的帧里没有 score15 / warnings", premature, []);
+
+    // 证据 id 是最终 id 的**前缀**——不是碰巧对上，是同一批解析结果
+    const streamedIds = only(events, "evidence").map((e) => e.value.id);
+    eq("证据 id 是最终 id 的前缀", streamedIds, streamed.evidence.map((e) => e.id).slice(0, streamedIds.length));
+    eq("证据一条不落", streamedIds.length, streamed.evidence.length);
+    check(
+      "未定位的引文照样逐条推（定位是最后统一算的）",
+      streamed.evidence.some((e) => !e.verified),
+      streamed.evidence.map((e) => e.verified),
+    );
+
+    // 逐条推的内容必须与最终结果一致
+    const summaryFrame = only(events, "summary")[0];
+    check("总评帧与最终总评一致", summaryFrame?.value === streamed.summary, summaryFrame?.value);
+    const strengthsFrame = only(events, "strengths")[0];
+    check(
+      "优点帧与最终优点一致",
+      JSON.stringify(strengthsFrame?.value) === JSON.stringify(streamed.strengths),
+      strengthsFrame?.value,
+    );
+    const dimFrames = only(events, "dimensionScores").flatMap((e) => e.value);
+    eq("维度分帧拼起来就是最终那三份", dimFrames, streamed.dimensionScores);
+
+    // pending 证据**不带**坐标字段：这样将来不可能有代码从一个还没定位的条目上
+    // 读出一个"定位失败"来
+    const firstEvidence = only(events, "evidence")[0]?.value;
+    check(
+      "证据帧是 pending 形状，不含坐标/verified/locateMethod",
+      firstEvidence?.pending === true &&
+        !("start" in firstEvidence) &&
+        !("end" in firstEvidence) &&
+        !("verified" in firstEvidence) &&
+        !("locateMethod" in firstEvidence),
+      firstEvidence,
+    );
+
+    // ③ 证据条数上限：模型给 18 条时，渐进视图不能先显示 18 张卡、
+    //    最终报告里却只有 15 张
+    const manyJson = JSON.stringify({
+      summary: "s",
+      evidence: Array.from({ length: 18 }, (_, i) => ({
+        dimension: "language",
+        kind: "minor",
+        quote: `quote ${i}`,
+        comment: `c${i}`,
+      })),
+    });
+    globalThis.fetch = (async () => sseResponse(manyJson, { chunkSize: 3 })) as typeof fetch;
+    const manyEvents: ReviewStreamEvent[] = [];
+    const manyResult = await reviewEssayStream({ essay: ESSAY, topic: TOPIC }, undefined, (e) =>
+      manyEvents.push(e),
+    );
+    eq("最终结果上限在 15 条", manyResult.evidence.length, MAX_EVIDENCE);
+    eq(
+      "推出去的证据条数与最终结果相同（不多不少）",
+      only(manyEvents, "evidence").length,
+      MAX_EVIDENCE,
+    );
+
+    // ④ 心跳。chars 不涨就是诚实的"上游没有新内容"，客户端靠它显示"还在动"
+    globalThis.fetch = (async () => sseResponse(modelJson, { chunkSize: 64, gapMs: 2400 })) as typeof fetch;
+    const hbEvents: ReviewStreamEvent[] = [];
+    await codeOfStream(undefined, hbEvents);
+    const beats = only(hbEvents, "progress").map((e) => e.chars);
+    check(
+      "上游卡住时会发心跳，且 chars 只增不减",
+      beats.length > 0 &&
+        beats.every((c, i) => i === 0 || c >= beats[i - 1]) &&
+        beats[beats.length - 1] > 0,
+      beats,
+    );
+
+    // ⑤ 上游在开流之前就失败：**一个帧都不许发**。
+    //    路由层就是靠这一点决定"回 SSE 还是回一个带真实状态码的 JSON 错误"的，
+    //    这条一旦破了，401/429/5xx 就全变成状态码 200 + 一帧 error
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+    const beforeOpen: ReviewStreamEvent[] = [];
+    eq("上游 429 → UPSTREAM_ERROR", await codeOfStream(undefined, beforeOpen), "UPSTREAM_ERROR");
+    eq("开流之前失败：一个帧都没发", beforeOpen.length, 0);
+
+    globalThis.fetch = (async () =>
+      new Response("nope", { status: 500, headers: { "Content-Type": "text/plain" } })) as typeof fetch;
+    const beforeOpen2: ReviewStreamEvent[] = [];
+    eq("上游 500 → UPSTREAM_ERROR", await codeOfStream(undefined, beforeOpen2), "UPSTREAM_ERROR");
+    eq("上游 500 时同样一个帧都没发", beforeOpen2.length, 0);
+
+    // 缺 key 也发生在开流之前
+    delete process.env.DEEPSEEK_API_KEY;
+    const noKey: ReviewStreamEvent[] = [];
+    eq("缺 API key → MISSING_API_KEY", await codeOfStream(undefined, noKey), "MISSING_API_KEY");
+    eq("缺 key 时一个帧都没发", noKey.length, 0);
+    process.env.DEEPSEEK_API_KEY = "sk-test-key-not-real";
+
+    // ⑥ 开流**之后**才失败：帧已经发出去了，只能走带内 error。
+    //    截断的 JSON 是这类失败里最典型的一种
+    globalThis.fetch = (async () => sseResponse(modelJson.slice(0, 150), { chunkSize: 7 })) as typeof fetch;
+    const afterOpen: ReviewStreamEvent[] = [];
+    eq("截断的模型输出 → BAD_MODEL_OUTPUT", await codeOfStream(undefined, afterOpen), "BAD_MODEL_OUTPUT");
+    check("这时已经有帧发出去了（所以只能带内报错）", afterOpen.length > 0, afterOpen.length);
+
+    // 被 max_tokens 截断要给一条能指导行动的话，而不是笼统的"不是合法 JSON"
+    globalThis.fetch = (async () =>
+      sseResponse('{"summary": "还没写完', { chunkSize: 5, finishReason: "length" })) as typeof fetch;
+    const truncatedMessage = await reviewEssayStream({ essay: ESSAY, topic: TOPIC }, undefined, () => undefined)
+      .then(() => "NO_ERROR")
+      .catch((e: { message?: string }) => e.message ?? "");
+    check("截断给出的文案提到 max_tokens 截断", truncatedMessage.includes("截断"), truncatedMessage);
+
+    // 上游一个字符都没吐（只有 [DONE]）：这就是"干净 EOF"在库层的对应物
+    globalThis.fetch = (async () => sseResponse("", {})) as typeof fetch;
+    const emptyMessage = await reviewEssayStream({ essay: ESSAY, topic: TOPIC }, undefined, () => undefined)
+      .then(() => "NO_ERROR")
+      .catch((e: { code?: string; message?: string }) => `${e.code}:${e.message ?? ""}`);
+    check("上游空内容 → BAD_MODEL_OUTPUT（不是静默成功）", emptyMessage.startsWith("BAD_MODEL_OUTPUT"), emptyMessage);
+
+    // ⑦ 中途取消。让上游卡在最后一片上，再从中断信号断开
+    globalThis.fetch = (async (_url: unknown, init: unknown) =>
+      sseResponse(modelJson, {
+        chunkSize: 16,
+        gapMs: 3000,
+        signal: (init as { signal?: AbortSignal }).signal,
+      })) as typeof fetch;
+    const ctrl = new AbortController();
+    const cancelling = codeOfStream(ctrl.signal);
+    setTimeout(() => ctrl.abort(), 60);
+    eq("批改途中断开 → CLIENT_ABORTED（不是 TIMEOUT）", await cancelling, "CLIENT_ABORTED");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalKey;
+  }
+}
+
 function finish() {
   console.log(`\n${"=".repeat(46)}`);
   console.log(`通过 ${passed} 项，失败 ${failed} 项`);
@@ -904,6 +1476,9 @@ runBodyLimitTests()
   .then(runRateLimitTests)
   .then(runE2E)
   .then(runAbortTest)
+  .then(runJsonStreamTests)
+  .then(runSseTests)
+  .then(runStreamParityTests)
   .catch((err) => {
     failed++;
     console.error("\n异步测试抛出异常：", err);

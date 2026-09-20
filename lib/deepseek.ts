@@ -8,6 +8,7 @@
  * 前提是对方兼容 /chat/completions 与 response_format=json_object。
  */
 
+import { createSseFrameParser, type SseFrame } from "./sse";
 import type { ReviewErrorResponse } from "./types";
 
 export class LLMError extends Error {
@@ -30,6 +31,11 @@ const DEFAULT_MODEL = "deepseek-chat";
  * 这个差值不能省：模型在第 99 秒返回后，还要解析输出、定位证据（逐条在原文里
  * 找）、组织响应，这些都要时间。两者相等的话，平台会在我们收尾时把函数掐掉，
  * 用户只看到一个平台级报错，而额度已经花掉了。
+ *
+ * 流式路径（openChatStream / readChatStream）里这个数的含义变大了：它成了**覆盖整个生成过程的
+ * 总预算**，而不再只是"等到响应头"。这不是顺带的好处，是必须的修正——
+ * fetch 在响应头到达时就 resolve 了，原来那个在 fetch 之后就 clearTimeout 的写法
+ * 会让生成阶段完全没有上限，上游挂住就会一直计费。停滞超时见 getStallMs()。
  */
 const DEFAULT_TIMEOUT_MS = 100_000;
 
@@ -65,6 +71,20 @@ function getBaseUrl(): string {
 function getTimeoutMs(): number {
   const raw = Number(process.env.REVIEW_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
+}
+
+/**
+ * 30 秒没有收到任何新字节就中止。
+ *
+ * 流式路径额外需要这个计时器。总预算（REVIEW_TIMEOUT_MS）只能说明"总共超过了
+ * 100 秒"，而用户实际遇到的失败几乎都是"卡住了、连接还在"。两者的提示语不一样，
+ * 后者能直接告诉用户发生了什么，前者只能给一个没有指导意义的数字。
+ */
+const DEFAULT_STALL_MS = 30_000;
+
+function getStallMs(): number {
+  const raw = Number(process.env.REVIEW_STALL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_STALL_MS;
 }
 
 /**
@@ -143,21 +163,8 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
   try {
     res = await fetch(`${getBaseUrl()}/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: opts.system },
-          { role: "user", content: opts.user },
-        ],
-        temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
-        max_tokens: opts.maxTokens ?? 4096,
-        response_format: { type: "json_object" },
-        stream: false,
-      }),
+      headers: chatHeaders(apiKey),
+      body: JSON.stringify(buildChatBody(opts, model, false)),
       signal: controller.signal,
     });
   } catch (err) {
@@ -165,13 +172,7 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
     if (err instanceof Error && err.name === "AbortError") {
       // 分清是谁掐的。客户端先断开时不能报超时——既误导用户，也会把
       // "用户自己关页面"记成服务端故障
-      if (external?.aborted) {
-        throw new LLMError("CLIENT_ABORTED", "客户端已断开连接，批改已中止。");
-      }
-      throw new LLMError(
-        "TIMEOUT",
-        `批改超时（超过 ${Math.round(getTimeoutMs() / 1000)} 秒）。可以调大 .env.local 里的 REVIEW_TIMEOUT_MS，或换一篇短一点的作文。`,
-      );
+      throw abortErrorFor(external?.aborted ? "client" : "budget");
     }
     // 网络层细节只进服务端日志，不透给客户端
     console.error("[deepseek] 请求模型服务失败：", err);
@@ -185,18 +186,8 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
   }
 
   if (!res.ok) {
-    // 上游的错误响应只进服务端日志。里面可能有余额提示、代理调试信息、
-    // 请求 id 之类不该给匿名调用方看的东西
-    const bodyText = await res.text().catch(() => "");
-    console.error(`[deepseek] 上游返回 ${res.status}：`, bodyText.slice(0, 1000));
-
-    throw new LLMError(
-      "UPSTREAM_ERROR",
-      res.status === 401 || res.status === 403
-        ? "模型服务拒绝了这次调用（鉴权失败）。多半是服务端的 DEEPSEEK_API_KEY 无效或已过期，请检查配置。"
-        : "模型服务返回了错误，批改未能完成。请稍后重试；若持续失败请查看服务端日志。",
-      res.status,
-    );
+    const failure = await upstreamFailure(res);
+    throw failure.error;
   }
 
   const payload = (await res.json().catch(() => null)) as
@@ -262,4 +253,396 @@ export function extractJson<T>(raw: string): T {
     "BAD_MODEL_OUTPUT",
     "模型没有返回可解析的 JSON，批改未能完成。这通常重试一次就好；若持续出现请查看服务端日志。",
   );
+}
+
+// ---------------------------------------------------------------------------
+// 请求构造与错误分类（chatJSON 与流式路径共用）
+//
+// 抽出来的理由不是"少写几行"，而是这几处正是自测盯得最紧的地方：
+// 同样的失败必须在两条传输路径上给出同样的错误码和同样的文案。
+// 复制一份的话，改了这边忘了那边是迟早的事。
+// ---------------------------------------------------------------------------
+
+function chatHeaders(apiKey: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+function buildChatBody(
+  opts: ChatJSONOptions,
+  model: string,
+  stream: boolean,
+  withJsonMode = true,
+): Record<string, unknown> {
+  return {
+    model,
+    messages: [
+      { role: "system", content: opts.system },
+      { role: "user", content: opts.user },
+    ],
+    temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
+    max_tokens: opts.maxTokens ?? 4096,
+    ...(withJsonMode ? { response_format: { type: "json_object" } } : {}),
+    stream,
+  };
+}
+
+type AbortReason = "client" | "budget" | "stall" | "none";
+
+/** 中止原因 → 错误。两条路径共用，保证同样的失败给出同样的文案。 */
+function abortErrorFor(reason: AbortReason): LLMError {
+  if (reason === "client") {
+    return new LLMError("CLIENT_ABORTED", "客户端已断开连接，批改已中止。");
+  }
+  if (reason === "stall") {
+    return new LLMError(
+      "TIMEOUT",
+      `模型超过 ${Math.round(getStallMs() / 1000)} 秒没有返回新内容，批改已中止。这通常是上游抖动，重试一次一般就好。`,
+    );
+  }
+  return new LLMError(
+    "TIMEOUT",
+    `批改超时（超过 ${Math.round(getTimeoutMs() / 1000)} 秒）。可以调大 .env.local 里的 REVIEW_TIMEOUT_MS，或换一篇短一点的作文。`,
+  );
+}
+
+/**
+ * 上游返回非 2xx。
+ *
+ * 把 bodyText 一并交出去，是因为流式路径要在**推出任何一帧之前**判断这次失败
+ * 是不是"上游不接受 response_format"——是的话就去掉它重试一次，
+ * 而重试的决定只能看响应体。开流之后就改不了状态码了，所以这一步必须提前。
+ */
+async function upstreamFailure(
+  res: Response,
+): Promise<{ status: number; bodyText: string; error: LLMError }> {
+  const bodyText = await res.text().catch(() => "");
+  // 上游的错误响应只进服务端日志。里面可能有余额提示、代理调试信息、
+  // 请求 id 之类不该给匿名调用方看的东西
+  console.error(`[deepseek] 上游返回 ${res.status}：`, bodyText.slice(0, 1000));
+
+  const error = new LLMError(
+    "UPSTREAM_ERROR",
+    res.status === 401 || res.status === 403
+      ? "模型服务拒绝了这次调用（鉴权失败）。多半是服务端的 DEEPSEEK_API_KEY 无效或已过期，请检查配置。"
+      : "模型服务返回了错误，批改未能完成。请稍后重试；若持续失败请查看服务端日志。",
+    res.status,
+  );
+
+  return { status: res.status, bodyText, error };
+}
+
+// ---------------------------------------------------------------------------
+// 流式
+// ---------------------------------------------------------------------------
+
+export interface ChatStreamOptions extends ChatJSONOptions {
+  /** 每收到一段文本增量调一次。回调抛异常会被吞掉，不能影响读取。 */
+  onDelta?: (text: string) => void;
+}
+
+export interface ChatStreamRead {
+  raw: string;
+  model: string;
+  elapsedMs: number;
+  /** 上游给的结束原因。"length" 表示被 max_tokens 截断了。 */
+  finishReason: string | null;
+}
+
+/**
+ * 已经建立、还没消费的流。
+ *
+ * 分成"打开"和"读取"两步，是为了让调用方能在**还没有向客户端写出任何字节之前**
+ * 就知道上游接不接受这次请求。少了这一步，上游的 401/5xx 就只能变成流里的一帧，
+ * 客户端的错误界面和 README 的错误码表都会失准。
+ */
+export interface ChatStreamHandle {
+  model: string;
+  /**
+   * 消费整个流。只能调用一次。
+   * 注意没有 usage：DeepSeek 只在 stream_options.include_usage 时才在流里给，
+   * 而那个字段有些兼容端点不认，不值得为一份没人消费的数据冒这个险。
+   */
+  read(): Promise<ChatStreamRead>;
+  /** 不打算消费就调它：取消上游连接、清掉计时器 */
+  dispose(): void;
+}
+
+/** 总预算 / 停滞 / 客户端断开，三个中止来源合成一个 controller，并记住是谁掐的。 */
+interface StreamWatch {
+  controller: AbortController;
+  reason: AbortReason;
+  /** 收到新数据就续命（重置停滞计时器） */
+  kick(): void;
+  dispose(): void;
+}
+
+function createAbortWatch(external: AbortSignal | undefined): StreamWatch {
+  const controller = new AbortController();
+  const watch: StreamWatch = {
+    controller,
+    reason: "none",
+    kick: () => arm(),
+    dispose: () => {
+      clearTimeout(budgetTimer);
+      clearTimeout(stallTimer);
+      external?.removeEventListener("abort", onExternalAbort);
+    },
+  };
+
+  const budgetTimer = setTimeout(() => {
+    if (watch.reason === "none") watch.reason = "budget";
+    controller.abort();
+  }, getTimeoutMs());
+
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      if (watch.reason === "none") watch.reason = "stall";
+      controller.abort();
+    }, getStallMs());
+  };
+  arm();
+
+  const onExternalAbort = () => {
+    watch.reason = "client";
+    controller.abort();
+  };
+  if (external) {
+    if (external.aborted) onExternalAbort();
+    else external.addEventListener("abort", onExternalAbort, { once: true });
+  }
+
+  return watch;
+}
+
+/**
+ * 发起一次流式请求并确认上游接受了它。**此时还没有读到任何内容。**
+ *
+ * 抛出的 LLMError 带着原始状态码，所以路由还能用正常的状态码回绝客户端。
+ */
+export async function openChatStream(
+  opts: ChatStreamOptions,
+): Promise<ChatStreamHandle> {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    throw new LLMError(
+      "MISSING_API_KEY",
+      "服务端没有可用的 DEEPSEEK_API_KEY。如果 .env.local 里还是 sk-xxxx 这样的占位值，" +
+        "请换成 https://platform.deepseek.com/api_keys 里的真实 key，然后重启开发服务器。",
+    );
+  }
+
+  const model = opts.model ?? getModel();
+  const startedAt = Date.now();
+  const watch = createAbortWatch(opts.signal);
+
+  const post = (withJsonMode: boolean) =>
+    fetch(`${getBaseUrl()}/chat/completions`, {
+      method: "POST",
+      headers: chatHeaders(apiKey),
+      body: JSON.stringify(buildChatBody(opts, model, true, withJsonMode)),
+      signal: watch.controller.signal,
+    });
+
+  const failedFetch = (err: unknown): never => {
+    watch.dispose();
+    if (err instanceof Error && err.name === "AbortError") {
+      throw abortErrorFor(watch.reason);
+    }
+    console.error("[deepseek] 请求模型服务失败：", err);
+    throw new LLMError(
+      "UPSTREAM_ERROR",
+      "无法连接到模型服务。请检查服务端网络与 DEEPSEEK_BASE_URL 配置，详情见服务端日志。",
+    );
+  };
+
+  let res: Response;
+  try {
+    res = await post(true);
+  } catch (err) {
+    return failedFetch(err);
+  }
+
+  if (!res.ok) {
+    const failure = await upstreamFailure(res);
+
+    // 兜底：上游不认 stream + response_format 这个组合时，去掉 response_format
+    // 重试一次。去掉之后仍然安全——提示词本来就把"只输出一个 JSON 对象"写死了，
+    // extractJson 有三层兜底，增量扫描器也能容忍 JSON 前面多几句客套话。
+    //
+    // 只在 400 且响应体明确提到 response_format 时才重试，不做无条件降级：
+    // json_object 确实减少了模型输出的废话，正常路径上不该丢掉它。
+    if (failure.status === 400 && /response_format/i.test(failure.bodyText)) {
+      console.error(
+        "[deepseek] 上游不接受 response_format，去掉它重试一次（流式组合的兜底）",
+      );
+      try {
+        res = await post(false);
+      } catch (err) {
+        return failedFetch(err);
+      }
+      if (!res.ok) {
+        watch.dispose();
+        throw (await upstreamFailure(res)).error;
+      }
+    } else {
+      watch.dispose();
+      throw failure.error;
+    }
+  }
+
+  if (!res.body) {
+    watch.dispose();
+    throw new LLMError("UPSTREAM_ERROR", "模型服务没有返回响应体，批改未能完成。");
+  }
+
+  return makeStreamHandle(res, model, startedAt, watch, opts.onDelta);
+}
+
+function makeStreamHandle(
+  res: Response,
+  model: string,
+  startedAt: number,
+  watch: StreamWatch,
+  onDelta: ((text: string) => void) | undefined,
+): ChatStreamHandle {
+  let consumed = false;
+
+  return {
+    model,
+    async read(): Promise<ChatStreamRead> {
+      if (consumed) throw new Error("ChatStreamHandle.read() 只能调用一次。");
+      consumed = true;
+      try {
+        return await readStreamBody(res, model, startedAt, watch, onDelta);
+      } finally {
+        // 读取结束（正常或异常）就撤掉计时器，别让它们在流关掉之后继续跑
+        watch.dispose();
+      }
+    },
+    dispose(): void {
+      if (consumed) return;
+      consumed = true;
+      watch.dispose();
+      // 主动取消：上游还有 token 在往外吐，我们不要了
+      res.body?.cancel().catch(() => undefined);
+    },
+  };
+}
+
+async function readStreamBody(
+  res: Response,
+  model: string,
+  startedAt: number,
+  watch: StreamWatch,
+  onDelta: ((text: string) => void) | undefined,
+): Promise<ChatStreamRead> {
+  const body = res.body;
+  if (!body) {
+    throw new LLMError("UPSTREAM_ERROR", "模型服务没有返回响应体，批改未能完成。");
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  const parser = createSseFrameParser();
+
+  let raw = "";
+  let finishReason: string | null = null;
+
+  const consume = (frames: SseFrame[]): void => {
+    for (const frame of frames) {
+      // [DONE] 不是 JSON，解析器会给出 data: undefined + raw: "[DONE]"
+      if (frame.raw.trim() === "[DONE]") continue;
+
+      const payload = frame.data as
+        | {
+            choices?: Array<{
+              delta?: { content?: unknown };
+              finish_reason?: unknown;
+            }>;
+          }
+        | undefined;
+      const choice = payload?.choices?.[0];
+      if (!choice) continue;
+
+      if (typeof choice.finish_reason === "string") {
+        finishReason = choice.finish_reason;
+      }
+      const text = choice.delta?.content;
+      if (typeof text !== "string" || !text) continue;
+
+      raw += text;
+      try {
+        onDelta?.(text);
+      } catch (err) {
+        // 回调只负责展示，它的异常绝不能打断读取
+        console.error("[deepseek] onDelta 回调抛出异常，已忽略：", err);
+      }
+    }
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // 停滞的定义就是"没有新字节"，所以任何一块数据都要续命。
+      // 这里必须在 push 之前——即使这一块只是半帧，也证明上游还活着。
+      watch.kick();
+      consume(parser.push(decoder.decode(value, { stream: true })));
+    }
+    // 收尾：最后一块可能没带结尾空行，补一个让解析器把攒着的帧吐出来
+    consume(parser.push(decoder.decode()));
+    consume(parser.push("\n\n"));
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw abortErrorFor(watch.reason);
+    }
+    console.error("[deepseek] 读取模型流失败：", err);
+    throw new LLMError(
+      "UPSTREAM_ERROR",
+      "读取模型输出时连接中断，批改未能完成。请重试一次。",
+    );
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // 已取消或已释放，忽略
+    }
+  }
+
+  return { raw, model, elapsedMs: Date.now() - startedAt, finishReason };
+}
+
+/**
+ * 把流式读到的累积文本解析成 JSON。
+ *
+ * 和 chatJSON 走同一个 extractJson，所以两条路径的解析规则不会分叉。
+ * 关键：最终对象永远是对**累积全文**解析一次得到的，增量扫描（lib/json-stream.ts）
+ * 只负责进度展示，它坏了也影响不到正确性。
+ */
+export function parseStreamedJSON<T>(read: ChatStreamRead): T {
+  if (!read.raw.trim()) {
+    throw new LLMError("BAD_MODEL_OUTPUT", "模型返回了空内容。");
+  }
+
+  try {
+    return extractJson<T>(read.raw);
+  } catch (err) {
+    // 被 max_tokens 截断时给一条能指导行动的错误，而不是笼统的"不是合法 JSON"
+    if (
+      read.finishReason === "length" &&
+      err instanceof LLMError &&
+      err.code === "BAD_MODEL_OUTPUT"
+    ) {
+      throw new LLMError(
+        "BAD_MODEL_OUTPUT",
+        `模型输出被 max_tokens 截断了（${read.raw.length} 字符），批改未能完成。请重试一次。`,
+      );
+    }
+    throw err;
+  }
 }

@@ -1,11 +1,15 @@
-import { DIMENSION_LABEL } from "@/lib/types";
 import type { ReviewResult } from "@/lib/types";
+
+import { DiagnosisCard } from "./DiagnosisCard";
 
 /**
  * 分数板：档次 + 15 分制 + 106.5 分制折算 + 官方档位描述 + 硬统计。
  *
  * 这里显示的档次是服务端按分数查表得到的（见 lib/rubric.ts 的 bandForScore），
  * 不是模型自己报的，所以它和分数永远自洽。
+ *
+ * 总评往后的内容在 DiagnosisCard 里——流式视图要单独用它，而分数板不能提前出现
+ * （分数要等上限校正，提前显示会当场跳一次），所以两者必须能分开渲染。
  */
 export function BandCard({ result }: { result: ReviewResult }) {
   const { band, score15, score106, stats } = result;
@@ -49,40 +53,11 @@ export function BandCard({ result }: { result: ReviewResult }) {
         </div>
       </div>
 
-      <div className="card">
-        <div className="label-cap">总评</div>
-        {result.summary}
-      </div>
-
-      {result.strengths.length > 0 && (
-        <div className="card">
-          <div className="label-cap">做对了什么</div>
-          <ul className="plain-list">
-            {result.strengths.map((s, i) => (
-              <li key={i}>{s}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      <h2 className="section-title">维度诊断</h2>
-      <div className="dims">
-        {result.dimensionScores.map((d) => (
-          <div className="dim-card" key={d.dimension}>
-            <div className="dim-name">
-              <span>{DIMENSION_LABEL[d.dimension]}</span>
-              <span className="dim-score">{d.score}/5</span>
-            </div>
-            <div className="meter">
-              <i style={{ width: `${Math.round((d.score / 5) * 100)}%` }} />
-            </div>
-            <p className="dim-comment">{d.comment}</p>
-          </div>
-        ))}
-      </div>
-      <p className="note">
-        四级作文采用整体评分法，上面三个维度分只用来显示强弱分布，不参与总分计算。
-      </p>
+      <DiagnosisCard
+        summary={result.summary}
+        strengths={result.strengths}
+        dimensionScores={result.dimensionScores}
+      />
     </>
   );
 }

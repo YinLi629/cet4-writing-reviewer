@@ -52,6 +52,31 @@ export interface Evidence {
   suggestion?: string;
 }
 
+/**
+ * 还没定位的候选证据：流式批改时引文一写完就能给用户看，但坐标算不出来。
+ *
+ * 为什么算不出来：lib/evidence.ts 的 locateAllEvidence 会把引文按长度从长到短
+ * 排序，并维护一组 claimed 区间来避免高亮互相重叠。也就是说**某一条引文的最终
+ * 坐标取决于整批引文**，在证据没到齐之前它不是一个"未知的值"，而是"还没有定义"。
+ *
+ * 刻意做成独立的类型、而不是给 Evidence 加一个 pending 标志位：加标志位的话
+ * `verified: false` 会被读成"这条没能定位"，而事实只是"还没开始定位"。
+ * 这里干脆不带 start/end/verified/locateMethod 这四个字段，
+ * 于是将来任何代码都不可能从一个还在定位的条目上误读出一个"失败"来。
+ */
+export interface PendingEvidence {
+  pending: true;
+  id: string;
+  dimension: Dimension;
+  kind: EvidenceKind;
+  quote: string;
+  comment: string;
+  suggestion?: string;
+}
+
+/** EvidenceList 能渲染的两种条目：已定位的、还在定位的。 */
+export type EvidenceListItem = Evidence | PendingEvidence;
+
 /** 升档建议：从当前档到目标档，具体要做什么。 */
 export interface UpgradeAction {
   /** 1 优先级最高 */
@@ -181,4 +206,73 @@ export interface ReviewErrorResponse {
     /** 客户端在批改完成前自己断开了，响应没人收 */
     | "CLIENT_ABORTED"
     | "UNKNOWN";
+}
+
+// ---------------------------------------------------------------------------
+// 流式批改（SSE）
+// ---------------------------------------------------------------------------
+
+/**
+ * 批改开始前就能确定、由代码算出来的统计。
+ *
+ * 刻意没有 evidenceCount/verifiedCount：那两个要等证据定位完才知道，
+ * 属于最终结果，不属于进度。
+ */
+export interface ReviewProgressStats {
+  wordCount: number;
+  sentenceCount: number;
+  paragraphCount: number;
+}
+
+/**
+ * SSE 事件。服务端按这个白名单构造帧，客户端按 type 归约。
+ *
+ * **任何一帧都不含 score15。** 分数要等上限校正（依据模型自己标的 major 条数和
+ * 维度分）算完才公布，提前露出模型的原始分会让它几秒后当场跳一次（13 → 12）。
+ * 过滤在服务端做，不靠客户端自觉——见 lib/review.ts 的 reviewEssayStream。
+ *
+ * 同理不含 warnings：lib/review.ts 里那条"分数已由系统校正：模型给出 N 分"
+ * 的文案会把被押后的原始分泄露出来。
+ */
+export type ReviewStreamEvent =
+  /** 立刻发出：作文的硬统计由代码算，不用等模型 */
+  | {
+      type: "meta";
+      stats: ReviewProgressStats;
+      model: string;
+      topic: string;
+      startedAt: string;
+    }
+  | { type: "summary"; value: string }
+  | { type: "strengths"; value: string[] }
+  | { type: "dimensionScores"; value: DimensionScore[] }
+  /** 一条一帧，逐条出现 */
+  | { type: "evidence"; value: PendingEvidence }
+  /**
+   * 定时心跳，无论上游有没有新内容都发。
+   * chars 不涨就是诚实的"上游没有新内容"——所以这里**没有百分比**，
+   * 总量是未知的，画一个按时间爬的进度条是骗人。
+   */
+  | { type: "progress"; chars: number }
+  /** 权威结果。到这一帧为止的渐进内容全部作废，用它覆盖。 */
+  | { type: "result"; result: ReviewResult }
+  | { type: "error"; error: string; code: ReviewErrorResponse["code"] };
+
+/**
+ * 客户端在等待期间积累的部分结果。
+ *
+ * 它**用完就丢**：批改完成后照旧写 sessionStorage 再跳 /result，权威报告在那边。
+ * 因此它不需要和 ReviewResult 对账，也就没有"部分结果与最终结果不一致"这类问题。
+ * 绝不能落盘，也绝不能传给 ResultActions / buildReportHtml。
+ */
+export interface ReviewProgress {
+  stats: ReviewProgressStats;
+  model: string;
+  topic: string;
+  /** 模型已输出的字符数。用来展示真实进度，不是百分比。 */
+  chars: number;
+  summary?: string;
+  strengths: string[];
+  dimensionScores: DimensionScore[];
+  evidence: PendingEvidence[];
 }

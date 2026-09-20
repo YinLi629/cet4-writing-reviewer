@@ -1,40 +1,40 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { BANDS } from "@/lib/rubric";
 import { SAMPLE_ESSAYS } from "@/lib/samples";
-import { loadAccessCode, pushHistory, saveAccessCode, saveResult } from "@/lib/store";
+import { loadAccessCode } from "@/lib/store";
 import { countEnglishWords } from "@/lib/text-stats";
 import {
   MAX_ESSAY_CHARS,
   MAX_TOPIC_CHARS,
   MIN_ESSAY_CHARS,
-  type ReviewErrorResponse,
-  type ReviewResult,
+  type ReviewRequest,
 } from "@/lib/types";
+import { useReviewStream } from "@/lib/use-review-stream";
 
-import { LoadingStages } from "./LoadingStages";
+import { ReviewProgress } from "./ReviewProgress";
 
 /** CET-4 作文的字数要求是「不少于 120 词」，超过 180 词通常也不再加分 */
 const TARGET_MIN = 120;
 const TARGET_MAX = 180;
 
 export function EssayForm() {
-  const router = useRouter();
-
   const [essay, setEssay] = useState("");
   const [topic, setTopic] = useState("");
   const [targetBandLevel, setTargetBandLevel] = useState<string>("");
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<{ message: string; code?: string } | null>(null);
   const [apiReady, setApiReady] = useState<boolean | null>(null);
   const [gated, setGated] = useState<boolean | null>(null);
   const [accessCode, setAccessCode] = useState("");
-  const [modelName, setModelName] = useState<string>("");
 
-  const abortRef = useRef<AbortController | null>(null);
+  // 一次批改的完整生命周期（请求、流式增量、终止态、跳转）都在这个 hook 里，
+  // 表单只管收集输入和渲染
+  const { phase, progress, error, start, cancel, reset } = useReviewStream();
+
+  // pending 覆盖 running 和 finished 两段：后者是"结果已到手、正在跳转"，
+  // 这时松开禁用会让用户看到表单闪一下
+  const pending = phase === "running" || phase === "finished";
 
   // 口令是记住的，下次访问直接预填，不用重输
   useEffect(() => {
@@ -46,11 +46,10 @@ export function EssayForm() {
     let cancelled = false;
     fetch("/api/review")
       .then((r) => r.json())
-      .then((d: { ready?: boolean; gated?: boolean; model?: string }) => {
+      .then((d: { ready?: boolean; gated?: boolean }) => {
         if (cancelled) return;
         setApiReady(Boolean(d.ready));
         setGated(Boolean(d.gated));
-        setModelName(d.model ?? "");
       })
       .catch(() => {
         if (!cancelled) setApiReady(null);
@@ -60,9 +59,6 @@ export function EssayForm() {
     };
   }, []);
 
-  // 组件卸载时掐掉还在飞的请求，避免 setState 打在已卸载的组件上
-  useEffect(() => () => abortRef.current?.abort(), []);
-
   const wordCount = useMemo(() => countEnglishWords(essay), [essay]);
   const tooShort =
     essay.trim().length > 0 && essay.trim().length < MIN_ESSAY_CHARS;
@@ -70,66 +66,33 @@ export function EssayForm() {
   // 这里只提前提示，让服务端返回那条说明清楚的上限错误
   const tooLong = essay.length > MAX_ESSAY_CHARS;
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const buildRequest = (): ReviewRequest => ({
+    essay,
+    topic: topic.trim() || undefined,
+    targetBandLevel: targetBandLevel ? Number(targetBandLevel) : undefined,
+    accessCode: accessCode.trim() || undefined,
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (pending) return;
-
-    setError(null);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setPending(true);
-
-    try {
-      const res = await fetch("/api/review", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          essay,
-          topic: topic.trim() || undefined,
-          targetBandLevel: targetBandLevel ? Number(targetBandLevel) : undefined,
-          accessCode: accessCode.trim() || undefined,
-        }),
-        signal: controller.signal,
-      });
-
-      const payload = (await res.json().catch(() => null)) as
-        | ReviewResult
-        | ReviewErrorResponse
-        | null;
-
-      if (!res.ok) {
-        const err = payload as ReviewErrorResponse | null;
-        setError({
-          message: err?.error ?? `请求失败（HTTP ${res.status}）。`,
-          code: err?.code,
-        });
-        return;
-      }
-
-      const result = payload as ReviewResult;
-      // 只在真的批改成功后才记住口令——口令错了就不该被持久化，
-      // 否则下次访问会预填一个错的值
-      if (accessCode.trim()) saveAccessCode(accessCode.trim());
-      saveResult(result);
-      pushHistory(result);
-      router.push("/result");
-    } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        // 用户自己取消的，不用报错
-        return;
-      }
-      setError({
-        message: `请求没有发出去：${err instanceof Error ? err.message : String(err)}`,
-      });
-    } finally {
-      setPending(false);
-      abortRef.current = null;
-    }
+    start(buildRequest());
   };
 
-  if (pending) {
-    return <LoadingStages modelName={modelName} />;
+  // running 时是无条件切换（连第一帧都还没到也要给个等待界面，那段是上游的首字节延迟）；
+  // failed 时只在已经拿到了内容的情况下留在进度视图里——否则连半成品都没有，
+  // 该做的是回到表单、把错误摆在输入框上方
+  if (pending || (phase === "failed" && progress)) {
+    return (
+      <ReviewProgress
+        progress={progress}
+        running={pending}
+        error={error}
+        onCancel={cancel}
+        onRetry={() => start(buildRequest())}
+        onBack={reset}
+      />
+    );
   }
 
   return (
@@ -300,7 +263,7 @@ export function EssayForm() {
             className="btn btn-ghost"
             onClick={() => {
               setEssay("");
-              setError(null);
+              reset();
             }}
           >
             清空
@@ -308,7 +271,7 @@ export function EssayForm() {
         )}
 
         <span className="muted small" style={{ marginLeft: "auto" }}>
-          通常需要 20–60 秒
+          通常 10 秒左右，长作文会更久
         </span>
       </div>
     </form>

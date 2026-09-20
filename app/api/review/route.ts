@@ -18,8 +18,14 @@ import { hasAccessCode, verifyAccessCode } from "@/lib/access";
 import { getModel, hasApiKey, LLMError } from "@/lib/deepseek";
 import { clientKeyFrom, sharedLimiter } from "@/lib/rate-limit";
 import { readJsonBody } from "@/lib/request-body";
-import { reviewEssay } from "@/lib/review";
-import { MAX_ESSAY_CHARS, type ReviewErrorResponse } from "@/lib/types";
+import { reviewEssay, reviewEssayStream } from "@/lib/review";
+import { encodeSseFrame, SSE_RESPONSE_HEADERS } from "@/lib/sse";
+import {
+  MAX_ESSAY_CHARS,
+  type ReviewErrorResponse,
+  type ReviewRequest,
+  type ReviewStreamEvent,
+} from "@/lib/types";
 
 // DeepSeek 调用需要 Node 运行时（用到了 process.env 和较长的超时）
 export const runtime = "nodejs";
@@ -138,30 +144,165 @@ export async function POST(request: Request) {
   }
   limiter.recordSuccess(clientKey);
 
-  try {
-    // 透传 request.signal：用户关标签页/刷新后，上游调用会被中止，
-    // 不再为一个没人在等的响应继续烧额度
-    const result = await reviewEssay(
-      (body ?? {}) as Parameters<typeof reviewEssay>[0],
-      request.signal,
-    );
-    return NextResponse.json(result, {
-      status: 200,
-      headers: { "Cache-Control": "no-store" },
-    });
-  } catch (err) {
-    if (err instanceof LLMError) {
-      // 客户端自己断开的，响应没人收，也不该记成服务端故障
-      if (err.code === "CLIENT_ABORTED") {
-        return errorResponse("CLIENT_ABORTED", "客户端已断开连接。");
-      }
-      return errorResponse(err.code, err.message);
-    }
+  const input = (body ?? {}) as ReviewRequest;
 
-    // 非预期错误：日志留全量，响应只给一句话，避免把内部细节泄露出去
-    console.error("[api/review] 未预期的错误：", err);
-    return errorResponse("UNKNOWN", "服务端出现未预期的错误，请查看运行终端里的日志。");
+  // REVIEW_STREAM=0 是运维逃生口：整个退回"一次请求一次返回"。
+  // 客户端是按响应的 content-type 分支的，所以不需要它配合改什么。
+  if (process.env.REVIEW_STREAM === "0") {
+    try {
+      // 透传 request.signal：用户关标签页/刷新后，上游调用会被中止，
+      // 不再为一个没人在等的响应继续烧额度
+      const result = await reviewEssay(input, request.signal);
+      return NextResponse.json(result, {
+        status: 200,
+        headers: { "Cache-Control": "no-store" },
+      });
+    } catch (err) {
+      const d = describeError(err);
+      return errorResponse(d.code, d.message);
+    }
   }
+
+  return streamReview(request, input);
+}
+
+/**
+ * 错误 → { code, message }。
+ *
+ * 两条路径共用一份映射，是为了让"同一个失败"在流式和非流式下给出同样的文案。
+ * 流式那条路还多一层要求：开了流之后状态码已经发出去了，这几个字段会变成
+ * 流里的一帧 error，客户端拿到的必须还是同一句话。
+ */
+function describeError(err: unknown): {
+  code: ReviewErrorResponse["code"];
+  message: string;
+} {
+  if (err instanceof LLMError) {
+    // 客户端自己断开的，响应没人收，也不该记成服务端故障
+    return {
+      code: err.code,
+      message: err.code === "CLIENT_ABORTED" ? "客户端已断开连接。" : err.message,
+    };
+  }
+
+  // 非预期错误：日志留全量，响应只给一句话，避免把内部细节泄露出去
+  console.error("[api/review] 未预期的错误：", err);
+  return {
+    code: "UNKNOWN",
+    message: "服务端出现未预期的错误，请查看运行终端里的日志。",
+  };
+}
+
+/**
+ * 流式批改：把 reviewEssayStream 的事件翻成 SSE 帧。
+ *
+ * 这里有一个**结构性的**要求：必须先把上游打开，再决定要不要开流。
+ *
+ * 原因是上游的鉴权失败（401/403）、被限流、5xx 全都发生在还没有任何内容的时候，
+ * 它们完全可以用正常的状态码回绝掉——客户端的错误界面（按 code 分流）和 README
+ * 的错误码表都依赖这一点。而一旦开始往响应里写字节，状态码就改不了了，
+ * 那些失败只能退化成流里的一帧 error，状态码一律变成 200。
+ *
+ * 做法：先跑流水线、把帧攒在内存里，等到"第一个事件到达（= 上游已经打开）"
+ * 或者"流水线整个失败"为止，再决定返回 SSE 还是返回 JSON 错误。
+ * 攒的那点数据最多一帧（meta），可以忽略。
+ */
+async function streamReview(
+  request: Request,
+  body: ReviewRequest,
+): Promise<Response> {
+  const encoder = new TextEncoder();
+  const queued: Uint8Array[] = [];
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let closed = false;
+
+  let markReady: () => void = () => undefined;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+
+  const push = (chunk: Uint8Array): void => {
+    if (closed) return;
+    if (!controller) {
+      queued.push(chunk);
+      return;
+    }
+    try {
+      controller.enqueue(chunk);
+    } catch {
+      // 客户端已经断开，后面的帧都丢掉
+      closed = true;
+    }
+  };
+
+  const onEvent = (event: ReviewStreamEvent): void => {
+    push(encoder.encode(encodeSseFrame(event.type, event)));
+    // 第一个事件一定是在上游打开成功之后才发出的（见 reviewEssayStream），
+    // 所以它到达就等于"这次请求至少不会以状态码失败收场了"
+    markReady();
+  };
+
+  // 结果包一层，避免 Promise 的 rejected 状态和"值是 undefined"混在一起
+  const outcome = reviewEssayStream(body, request.signal, onEvent).then(
+    () => ({ failed: false as const }),
+    (err: unknown) => ({ failed: true as const, err }),
+  );
+
+  await Promise.race([ready, outcome]);
+
+  if (queued.length === 0) {
+    // 一个事件都没发出来 = 上游没打开，或者输入校验就没过。
+    // 此时 outcome 必然已经落定（要么它让 race 结束了，要么 ready 从没 resolve 过），
+    // 所以这个 await 不会挂住。
+    const settled = await outcome;
+    const d = settled.failed
+      ? describeError(settled.err)
+      : describeError(new Error("批改没有产生任何事件"));
+    return errorResponse(d.code, d.message);
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+      for (const chunk of queued) c.enqueue(chunk);
+      queued.length = 0;
+    },
+    cancel() {
+      // 客户端断开（关标签页/点取消）。request.signal 会一起触发，
+      // 上游调用随之被中止，不再为一个没人在等的批改继续计费。
+      closed = true;
+      controller = null;
+    },
+  });
+
+  // 收尾。失败只能补一帧 error——响应头早就发出去了，改不了状态码。
+  void outcome.then((settled) => {
+    if (settled.failed) {
+      const d = describeError(settled.err);
+      // 载荷带上 type，和其它帧保持同一种形状——客户端就可以一视同仁地
+      // 当成 ReviewStreamEvent 来读，不用给 error 单独开一条解析分支
+      push(
+        encoder.encode(
+          encodeSseFrame("error", {
+            type: "error",
+            error: d.message,
+            code: d.code,
+          }),
+        ),
+      );
+    }
+    closed = true;
+    try {
+      controller?.close();
+    } catch {
+      // 已经关了，或者客户端断开时被取消过，忽略
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: SSE_RESPONSE_HEADERS,
+  });
 }
 
 /**

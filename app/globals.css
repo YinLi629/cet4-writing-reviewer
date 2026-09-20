@@ -441,6 +441,27 @@ a {
   letter-spacing: 0;
 }
 
+/*
+ * 流式批改期间的记分板：位置先占住，数字还没到时候（分数要等上限校正，
+ * 提前显示会当场跳一次）。缩字号是因为"计算中"三个字按 52px 排会撑破数字位，
+ * min-height 对齐 52px 的数字高度，跳到结果页时版块上下不跳。
+ */
+.score-big-pending {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0;
+  display: flex;
+  align-items: center;
+  min-height: 52px;
+}
+
+.score-big-pending small {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
 .score-106 {
   color: var(--muted);
   font-size: 14px;

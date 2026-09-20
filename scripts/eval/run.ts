@@ -10,6 +10,11 @@
  *   npm run eval          # 跑全量
  *   npm run eval -- --only=a1,a2      # 只跑指定 id
  *   npm run eval -- --concurrency=4   # 调并发（默认 3）
+ *   npm run eval -- --stream          # 走流式路径（走的是 /api/review 用的那条）
+ *
+ * --stream 不是"另测一套逻辑"：lib/review.ts 的两条路共用同一份校验、提示词和后处理，
+ * 自测里有一条断言它们对同一份模型输出给出完全相同的结果。这里用它来量真东西：
+ * **首帧延迟**（用户在等待界面上看到第一个字的时刻）和事件流水是否自洽。
  *
  * 输出落在 .eval-out/raw-<时间戳>.json，用 analyze.ts 分析。
  */
@@ -17,9 +22,9 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { reviewEssay } from "../../lib/review";
+import { reviewEssay, reviewEssayStream } from "../../lib/review";
 import { computeStats, countEnglishWords } from "../../lib/text-stats";
-import type { ReviewResult } from "../../lib/types";
+import type { ReviewResult, ReviewStreamEvent } from "../../lib/types";
 import { CORPUS, type EvalCase } from "./corpus";
 import { ENV_FILE, EVAL_OUT_DIR } from "./paths";
 
@@ -58,6 +63,27 @@ export interface RunRecord {
   ok: boolean;
   error?: { code?: string; message: string };
   result?: ReviewResult;
+  /** 走流式路径（--stream）时才有：用来量等待体验到底改善了多少 */
+  stream?: StreamStats;
+}
+
+export interface StreamStats {
+  /** 第一个事件（meta）到达的时刻，毫秒、相对本次请求开始。约等于上游的首字节延迟 */
+  firstFrameMs: number;
+  /** 全部帧数 */
+  frames: number;
+  progressFrames: number;
+  evidenceFrames: number;
+  /**
+   * 观测到模型确实在吐字的时刻。注意粒度是心跳周期（2 秒），所以它是个**上界**，
+   * 不是"第一个字符到达"的精确时间——想要精确值得让服务端每来一个 delta 就发一帧，
+   * 那个代价不值得
+   */
+  firstCharMs: number;
+  /** result 帧带的对象与函数返回值是不是同一个（不是同一个就说明投影错了） */
+  resultFrameMatches: boolean;
+  /** 结果出现前的最后一帧是第几帧——在它之前都是渐进内容 */
+  lastProgressiveFrame: number;
 }
 
 /** 限定并发的任务池。并发太高容易被上游限流，也会让单次耗时失真。 */
@@ -98,6 +124,9 @@ async function main(): Promise<void> {
 
   const only = argValue("only")?.split(",").map((s) => s.trim()).filter(Boolean);
   const concurrency = Number(argValue("concurrency") ?? 3) || 3;
+  // 注意这里是**裸开关**（--stream），不是 --stream=1。
+  // argValue 找的是 `--name=`，用它判断会把裸开关判成"没给"
+  const useStream = process.argv.includes("--stream");
 
   const cases: EvalCase[] = only
     ? CORPUS.filter((c) => only.includes(c.id))
@@ -112,7 +141,8 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    `共 ${cases.length} 篇作文、${runs.length} 次调用（并发 ${concurrency}）。` +
+    `共 ${cases.length} 篇作文、${runs.length} 次调用（并发 ${concurrency}，` +
+      `${useStream ? "流式" : "普通"}）。` +
       `这会真实计费。\n模型：${process.env.DEEPSEEK_MODEL || "deepseek-chat"}\n`,
   );
 
@@ -130,15 +160,52 @@ async function main(): Promise<void> {
       objective: objectiveStats(c.essay),
     };
     try {
-      const result = await reviewEssay({ essay: c.essay, topic: c.topic });
+      let stream: StreamStats | undefined;
+      let result: ReviewResult;
+
+      if (useStream) {
+        const events: ReviewStreamEvent[] = [];
+        let firstFrameMs = -1;
+        let firstCharMs = -1;
+        let chars = 0;
+        let resultFrameMatches = false;
+
+        result = await reviewEssayStream({ essay: c.essay, topic: c.topic }, undefined, (e) => {
+          if (firstFrameMs < 0) firstFrameMs = Date.now() - rt0;
+          if (e.type === "progress" && e.chars > chars) {
+            if (firstCharMs < 0) firstCharMs = Date.now() - rt0;
+            chars = e.chars;
+          }
+          events.push(e);
+        });
+
+        // 在回调里比不了：result 帧是在 reviewEssayStream 返回之前发出的，
+        // 那一刻外层变量还没赋值。所以等拿到返回值之后再认一次身份
+        const resultFrame = events[events.length - 1];
+        resultFrameMatches = resultFrame.type === "result" && resultFrame.result === result;
+
+        stream = {
+          firstFrameMs,
+          firstCharMs,
+          frames: events.length,
+          progressFrames: events.filter((e) => e.type === "progress").length,
+          evidenceFrames: events.filter((e) => e.type === "evidence").length,
+          resultFrameMatches,
+          lastProgressiveFrame: events.findIndex((e) => e.type === "result"),
+        };
+      } else {
+        result = await reviewEssay({ essay: c.essay, topic: c.topic });
+      }
+
       const ms = Date.now() - rt0;
       console.log(
         `  ✓ ${id.padEnd(6)} ${String(result.score15).padStart(2)} 分  ` +
           `${result.band.label}  ${String(ms).padStart(6)}ms  ` +
           `证据 ${result.stats.verifiedCount}/${result.stats.evidenceCount}  ` +
-          `警告 ${result.warnings.length}`,
+          `警告 ${result.warnings.length}` +
+          (stream ? `  首帧 ${stream.firstFrameMs}ms / 首字 ${stream.firstCharMs}ms` : ""),
       );
-      return { ...base, elapsedMs: ms, ok: true, result };
+      return { ...base, elapsedMs: ms, ok: true, result, stream };
     } catch (e) {
       const ms = Date.now() - rt0;
       const err = e as { code?: string; message?: string };
