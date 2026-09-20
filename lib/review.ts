@@ -15,15 +15,18 @@
 
 import { chatJSON, getModel, LLMError } from "./deepseek";
 import { attachLocations } from "./evidence";
-import { buildReviewPrompt, MAX_EVIDENCE, MIN_EVIDENCE } from "./prompt";
+import { buildReviewPrompt, MAX_EVIDENCE, minEvidenceFor } from "./prompt";
 import { computeStats } from "./text-stats";
 import {
+  applyCeiling,
   bandForScore,
   clampScore15,
   DIMENSION_MAX,
+  enforcedCeilings,
   ESSAY_MAX_SCORE_106,
   isValidBandLevel,
   RUBRIC_VERSION,
+  strictestCeiling,
   toScore106,
 } from "./rubric";
 import {
@@ -318,18 +321,14 @@ export async function reviewEssay(
   const { system, user } = buildReviewPrompt({
     essay: input.essay,
     topic: input.topic || undefined,
+    stats,
     targetBandLevel: input.targetBandLevel,
   });
 
   const call = await chatJSON<Record<string, unknown>>({ system, user, signal });
   const raw = call.data;
 
-  // 1) 分数与档次：分数来自模型，档次由代码查表
-  const score15 = clampScore15(raw.score15);
-  const band = bandForScore(score15);
-  const score106 = toScore106(score15);
-
-  // 2) 证据：解析 → 定位
+  // 1) 证据：解析 → 定位。先做这步，因为下面的分数校正要看模型标了几条 major
   const parsedEvidence = parseEvidence(raw.evidence);
   if (parsedEvidence.length === 0) {
     throw new LLMError(
@@ -345,14 +344,62 @@ export async function reviewEssay(
       `有 ${unverified.length} 条引用没能在原文中定位（模型可能改写了原文），这些条目在报告里已标出，请以原文为准。`,
     );
   }
-  if (evidence.length < MIN_EVIDENCE) {
+  const evidenceMin = minEvidenceFor(stats);
+  if (evidence.length < evidenceMin) {
     warnings.push(
-      `本次只取到 ${evidence.length} 条证据（建议至少 ${MIN_EVIDENCE} 条），覆盖可能不够全面。`,
+      `本次只取到 ${evidence.length} 条证据（这篇作文建议至少 ${evidenceMin} 条），覆盖可能不够全面。`,
     );
   }
 
-  // 3) 维度诊断（不参与总分）
-  const dimensionScores = parseDimensionScores(raw.dimensionScores, band.level, warnings);
+  // 重复引文：**同一维度内**同一条引文被用在多条证据里，等于用一句话充了两条。
+  // 只按维度内查重，不跨维度——一句话同时是"内容上点题"和"结构上没分段"的
+  // 证据是合理的（c3/c9 就是这样），跨维度复用在评测里 3 次全部是这种正常情况，
+  // 警告只会在假阳性上响，反而会让用户学会忽略警告。
+  const quoteSeen = new Set<string>();
+  let duplicated = 0;
+  for (const e of evidence) {
+    const key = `${e.dimension}::${e.quote.trim()}`;
+    if (quoteSeen.has(key)) duplicated += 1;
+    else quoteSeen.add(key);
+  }
+  if (duplicated > 0) {
+    warnings.push(
+      `有 ${duplicated} 条证据在同一维度里重复引用了同一段原文，等同于用一句话充了两条。`,
+    );
+  }
+
+  // 2) 维度诊断（不参与总分）。先按模型给的原分算出临时档次，只用于给缺失的
+  //    维度补一个兜底分值，避免"档次依赖维度分、维度分又依赖档次"的循环。
+  const rawScore = clampScore15(raw.score15);
+  const dimensionScores = parseDimensionScores(
+    raw.dimensionScores,
+    bandForScore(rawScore).level,
+    warnings,
+  );
+  const dimScore = (d: Dimension) =>
+    dimensionScores.find((x) => x.dimension === d)?.score ?? null;
+
+  // 3) 分数校正：模型给的分不能突破它自己的诊断所允许的上限。
+  //    规则见 lib/rubric.ts 的 CEILING_RULES——每条都能从官方档次描述推出来。
+  const ceiling = strictestCeiling(
+    enforcedCeilings({
+      majorCount: evidence.filter((e) => e.kind === "major").length,
+      organizationScore: dimScore("organization"),
+      contentScore: dimScore("content"),
+      wordCount: stats.wordCount,
+      paragraphCount: stats.paragraphCount,
+    }),
+  );
+  const score15 = applyCeiling(rawScore, ceiling);
+  if (ceiling && rawScore > ceiling.maxScore) {
+    warnings.push(
+      `分数已由系统校正：模型给出 ${rawScore} 分，但它自己的诊断不支撑这个分数——${ceiling.reason}` +
+        `分数已降为 ${score15} 分。`,
+    );
+  }
+
+  const band = bandForScore(score15);
+  const score106 = toScore106(score15);
 
   // 4) 升档建议
   const upgradePlan = parseUpgradePlan(

@@ -12,19 +12,36 @@
 
 import {
   BANDS,
+  CEILING_RULE_TABLE,
   DIMENSION_GUIDE,
   EVIDENCE_KIND_GUIDE,
   ESSAY_MAX_SCORE_106,
   ESSAY_MAX_SCORE_15,
   RUBRIC_VERSION,
+  TARGET_WORDS_MAX,
+  TARGET_WORDS_MIN,
+  TIER_GAP,
   tierGapFor,
 } from "./rubric";
+import type { TextStats } from "./text-stats";
 import { DIMENSIONS } from "./types";
 
 /** 证据条数下限。太少说明模型没认真读，会触发重试。 */
 export const MIN_EVIDENCE = 5;
 /** 证据条数上限。防止模型把整篇作文拆成一百条，报告没法看。 */
 export const MAX_EVIDENCE = 15;
+
+/**
+ * 这篇作文至少该给几条证据。
+ *
+ * 固定要求 5 条会在极短的作文上逼模型凑数：评测里 c2 只有两句话
+ * （"Sports is good. I like it very much."），模型硬凑了 5 条，把同一句话
+ * 在 content 和 language 下各引用一遍，其中两条还完全相同。证据条数应该
+ * 跟着作文能提供的材料量走，凑出来的证据比少几条更糟。
+ */
+export function minEvidenceFor(stats: TextStats): number {
+  return Math.max(3, Math.min(MIN_EVIDENCE, stats.sentenceCount));
+}
 
 /**
  * 要求模型返回的 JSON 结构。
@@ -82,7 +99,38 @@ const KIND_RULES = `【关于 kind 的判定】
 
 严格区分 minor 与 major。时态混乱、主谓不一致、句子结构残缺、可数名词与冠词系统性误用、
 中式英语导致语义不通——这些是 major。个别笔误、单处搭配不当、大小写疏漏——这些是 minor。
-不要把所有错误都标成 major，那等于没有区分度。`;
+不要把所有错误都标成 major，那等于没有区分度。
+
+标成 major 之前先确认它**真的是错误**。下面这些是正确用法，不要标错：
+- each / every / one 之后用 his、his or her、their 指代，都是可接受的，不算不一致；
+- 并列句共用同一个主语是合法省略。例如 "We can sing and dance" 里 dance 前面
+  没有 can 并不是错误，不要标成"结构不完整"；
+- 主语是复数时用动词原形是对的。sports 作复数主语时 "sports waste time" 正确，
+  不要判成主谓不一致；
+- 动名词的复合结构（如 "without our noticing"）是合法的。
+
+拿不准是不是错误，就标 minor，不要标 major。major 的数量会直接影响分数，
+标错一条的代价比漏标一条更大。`;
+
+/**
+ * organization 证据的额外约束。
+ *
+ * 为什么要单独约束这一个维度：评测里 24 次运行的 organization 维度分只有
+ * 4/5 和 5/5 两种取值，58 条 organization 证据里有 20 条是"First of all…"
+ * "In conclusion…"这类连接词句。模型的判据变成了"文中有没有过渡词"——
+ * 而过渡词几乎每篇作文都有，于是这一项恒等于高分。最直接的后果是 c6：
+ * 一篇 154 词、全文不分段的长文，organization 拿了 5/5，还写着"段落划分合理"。
+ */
+const ORGANIZATION_EVIDENCE_RULES = `【关于 organization 证据的硬性要求】
+organization 的证据必须描述**真实的段落结构**——第几段承担什么功能、段与段之间靠什么衔接、
+分段是否合理、有没有逻辑跳跃。
+1. 禁止把一句连接词本身当作 organization 的亮点。"First of all, ..." "In conclusion, ..."
+   这样的句子只能说明"这里有过渡词"，不能说明结构好。只要你的理由里出现"用 XX 连接词
+   组织段落"这类说法，这条证据就不合格。
+2. 如果客观统计显示全文只有一段，你必须直接指出"全文未分段"，并说明它对读者理解的影响，
+   绝对不可以写"段落划分合理"或"结构清晰"。
+3. 如果分段的**数量**和文章长度不匹配（例如 150 词只有 1-2 段，或者一段只有一句话），
+   organization 维度分不能高于 3/5，并在诊断里说明原因。`;
 
 function formatBandTable(): string {
   return BANDS.map(
@@ -91,9 +139,31 @@ function formatBandTable(): string {
   ).join("\n");
 }
 
+/**
+ * 档与档之间的差距，整张梯子都注入。
+ *
+ * 为什么不只注入"当前档"那一级：当前档要等模型给出分数才知道，是循环依赖。
+ * 而这段文字里有一条**不能省**——TIER_GAP[3] 的"严重错误（时态、主谓一致、
+ * 句子结构残缺、可数不可数误用）必须清零"才能到 11 分档。在把整张梯子注入
+ * 之前，这句话从来没进过提示词（reviewEssay 不传 currentBandLevel，
+ * tierGapFor 只在模型能看到的条件分支里），于是模型会一边标出 major 一边给
+ * 11 分，还自认为自洽——评测里 a3 和 c8 都是这个失效模式。
+ */
+function formatTierGaps(): string {
+  return BANDS.filter((b) => b.level > 0)
+    .map((b) => `- ${TIER_GAP[b.level - 1] ?? ""}`)
+    .filter((s) => s.length > 4)
+    .join("\n");
+}
+
 export interface ReviewPromptInput {
   essay: string;
   topic?: string;
+  /**
+   * 代码算出来的硬统计。必须传：模型没法自己数准段落数，不给它就会编。
+   * 评测里 c6 是一整段没有分段的 154 词长文，模型却写"段落划分合理，主题句明确"。
+   */
+  stats: TextStats;
   /** 目标档次 level。给了就在升档建议里对着这个目标写。 */
   targetBandLevel?: number;
   /** 当前档 level，用于取档次差距。第一轮调用时未知，可不传。 */
@@ -107,7 +177,8 @@ export interface BuiltPrompt {
 }
 
 export function buildReviewPrompt(input: ReviewPromptInput): BuiltPrompt {
-  const { essay, topic, targetBandLevel, currentBandLevel } = input;
+  const { essay, topic, stats, targetBandLevel, currentBandLevel } = input;
+  const evidenceMin = minEvidenceFor(stats);
 
   const system = `你是一位全国大学英语四级考试（CET-4）作文阅卷员，有多年阅卷经验。
 你的任务是批改一篇学生作文，输出档次判断、诊断意见、原文证据与升档建议。
@@ -120,6 +191,9 @@ export function buildReviewPrompt(input: ReviewPromptInput): BuiltPrompt {
 【档次表】
 ${formatBandTable()}
 
+【档与档之间的差距（定完分后，用你所在档位对应的那一条来写升档理由）】
+${formatTierGaps()}
+
 你只负责给 score15 这个整数。档次名称由系统按分数查表得出，你不需要在输出里写档次名。
 请严格按上面的档次描述来定分：描述里写"少量语言错误"就是 11 分档，
 写"语言错误相当多，其中有一些是严重错误"就是 8 分档，不要凭感觉上浮。
@@ -131,10 +205,23 @@ ${QUOTE_RULES}
 
 ${KIND_RULES}
 
+${ORGANIZATION_EVIDENCE_RULES}
+
+【分数上限的硬性要求（重要）】
+score15 是整体印象分，但它**不能和你自己给出的诊断互相矛盾**。
+定完分之后，回头对照下面的上限，有多条同时适用时取最严的那一条：
+${CEILING_RULE_TABLE.map((s) => `- ${s}`).join("\n")}
+
+这些上限不是额外的扣分项，而是档次描述本身的要求（比如"基本无语言错误"就是 14 分档
+描述里的原话）。如果你觉得上限压低了合理分数，正确的做法是**回头检查你的证据和维度分
+是不是标错了**，而不是突破上限。同理，把本该标 major 的错误降格成 minor 来换高分，
+会让诊断失真，那比分数偏低更糟。
+
 【证据条数】
-至少 ${MIN_EVIDENCE} 条，最多 ${MAX_EVIDENCE} 条。要覆盖 language 维度为主，
+这篇作文至少 ${evidenceMin} 条，最多 ${MAX_EVIDENCE} 条。要覆盖 language 维度为主，
 但 content 和 organization 也必须有证据，不能三个维度里有两个是空的。
-如果作文确实写得很好，strength 类证据可以占多数，但依然要指出仍可改进之处。
+每条证据必须是**不同的原文片段**——同一条引文不要重复使用。如果一句话既有亮点又有问题，
+写成一条说明，不要拆成两条来凑条数。作文很短时，宁可少给几条，也不要重复引用同一句。
 
 【升档建议】
 给 3-5 条，按 priority 从 1 开始递增排序。每条都必须是这篇作文**具体可执行**的动作，
@@ -157,6 +244,14 @@ ${JSON_CONTRACT}`;
 
   const user = `${topicBlock}
 ${gap}
+【客观统计（由系统直接计算，请以此为准，不要自己估）】
+- 词数：${stats.wordCount}（四级要求 ${TARGET_WORDS_MIN}-${TARGET_WORDS_MAX} 词）
+- 句数：${stats.sentenceCount}
+- 段数：${stats.paragraphCount}
+
+段数是按换行统计出来的真实值。判断 organization 时必须以这个数字为准，
+不要因为文中有连接词就认为分段合理。
+
 【学生作文原文】
 <<<ESSAY_START>>>
 ${essay}

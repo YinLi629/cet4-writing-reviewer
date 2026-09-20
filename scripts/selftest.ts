@@ -12,7 +12,18 @@ import { METHOD_LABEL } from "../lib/labels";
 import { clientKeyFrom, configFromEnv, createRateLimiter } from "../lib/rate-limit";
 import { buildReportHtml, escapeHtml, renderHighlightedEssay } from "../lib/report-html";
 import { MAX_BODY_BYTES, readJsonBody } from "../lib/request-body";
-import { bandForScore, clampScore15, toScore106, tierGapFor } from "../lib/rubric";
+import {
+  applicableCeilings,
+  applyCeiling,
+  bandForScore,
+  CEILING_RULE_TABLE,
+  clampScore15,
+  enforcedCeilings,
+  strictestCeiling,
+  toScore106,
+  tierGapFor,
+  type CeilingContext,
+} from "../lib/rubric";
 import { __internals, normalizeInput, reviewEssay } from "../lib/review";
 import { computeStats } from "../lib/text-stats";
 import { MAX_ESSAY_CHARS, MAX_QUOTE_CHARS, MAX_TOPIC_CHARS, type ReviewResult } from "../lib/types";
@@ -136,6 +147,85 @@ eq("0 分 → 0", toScore106(0), 0);
 
 check("升档差距：有对应文案", tierGapFor(3).includes("8 分档到 11 分档"), tierGapFor(3));
 check("升档差距：跨档时串起中间档", tierGapFor(1, 3).split("从").length - 1 >= 2, tierGapFor(1, 3));
+
+// ---------------------------------------------------------------------------
+console.log("\n[2b] 分数上限（模型的分不能突破它自己的诊断）");
+
+// 默认是一篇"没有任何问题"的作文：150 词、4 段、无 major、维度满分
+const ctx = (over: Partial<CeilingContext> = {}): CeilingContext => ({
+  majorCount: 0,
+  organizationScore: 5,
+  contentScore: 5,
+  wordCount: 150,
+  paragraphCount: 4,
+  ...over,
+});
+// 代码实际强制的那一层
+const ceil = (over: Partial<CeilingContext> = {}) =>
+  strictestCeiling(enforcedCeilings(ctx(over)));
+
+eq("各方面正常 → 不设上限", ceil(), null);
+// 1-2 条 major 不强制：模型的 major 标注有 run-to-run 抖动（b1 两次运行
+// 分别标了 0 条和 2 条），单条标注不足以支撑改分
+eq("1 条 major → 不强制（留给 prompt 指引）", ceil({ majorCount: 1 }), null);
+eq("2 条 major → 不强制", ceil({ majorCount: 2 }), null);
+// prompt 里对 major 讲的是定性版（只要有一条就不许进 11 分档），比代码严。
+// 同时也守住"别把这条的阈值写进 prompt"——写进去等于教模型少标两条来绕开上限。
+// （many-major 的"5 处及以上"不受此限：那条本来就是公开的、极严的数字，
+//   而且少报到 4 条以下也躲不开上面这条定性规则。）
+check(
+  "prompt 对 major 讲的是定性版、没暴露 3 条这个阈值",
+  CEILING_RULE_TABLE.some((s) => s.includes("只要标出了 major")) &&
+    !CEILING_RULE_TABLE.some((s) => /标出 3 处/.test(s)),
+  CEILING_RULE_TABLE,
+);
+eq("3 条 major → 上限 9", ceil({ majorCount: 3 })?.maxScore, 9);
+eq("4 条 major → 上限 9", ceil({ majorCount: 4 })?.maxScore, 9);
+eq("5 条 major → 上限 6", ceil({ majorCount: 5 })?.maxScore, 6);
+eq("9 条 major → 上限 6", ceil({ majorCount: 9 })?.maxScore, 6);
+eq("词数 99 → 上限 9", ceil({ wordCount: 99 })?.maxScore, 9);
+eq("词数 100 → 不设上限（刚好达标线）", ceil({ wordCount: 100 }), null);
+eq("词数 110 → 不设上限", ceil({ wordCount: 110 }), null);
+eq("词数 <60 → 上限 6", ceil({ wordCount: 59 })?.maxScore, 6);
+// 分段问题**不**直接砍总分：8 分档的描述要求"语言错误相当多"，而单段但语言
+// 通顺的作文（评测里的 c6）不满足这个描述。分段走 organization 维度，
+// 由 weak-organization 间接影响总分。
+eq("单段长文不直接压总分", ceil({ paragraphCount: 1, wordCount: 154 }), null);
+eq("单段短文只按字数算（40 词 → 6）", ceil({ paragraphCount: 1, wordCount: 40 })?.maxScore, 6);
+// organization 的软规则：写进 prompt 但代码不强制。
+// 阈值是 ≤2 而不是 ≤3——11 分档和 14 分档的条文**都**要求"连贯"，
+// 所以 organization 分根本区分不了这两档，只该兜"结构真的崩了"。
+// 3/5 表示"段落划分一般"，评测里 b1/b2（156 词切 7 段）就是这个分，
+// 它们被判 13 分是对的，不该被规则压。
+eq("organization 3/5 → 不设上限（一般，不是崩）", ceil({ organizationScore: 3 }), null);
+eq("organization 2/5 → 仍在 prompt 的完整规则表里（上限 12）", strictestCeiling(applicableCeilings(ctx({ organizationScore: 2 })))?.maxScore, 12);
+eq("organization 1/5 → 还在表里", strictestCeiling(applicableCeilings(ctx({ organizationScore: 1 })))?.maxScore, 12);
+eq("organization 2/5 → 代码不强制", ceil({ organizationScore: 2 }), null);
+eq("content 2/5 → 上限 9", ceil({ contentScore: 2 })?.maxScore, 9);
+eq("content 1/5 → 上限 4（文不对题）", ceil({ contentScore: 1 })?.maxScore, 4);
+eq("content 0/5 → 上限 4", ceil({ contentScore: 0 })?.maxScore, 4);
+eq("content 3/5 → 不设上限（一般，不是套话）", ceil({ contentScore: 3 }), null);
+eq("content 4/5 → 不设上限", ceil({ contentScore: 4 }), null);
+// a6 复现：模型自己写"全文没有一处提到 sports、没有回应题目要点"，content 给 1，
+// 总分却给 5。0 分档的条文（文不对题）必须把它压下来。
+eq("a6 复现：content 1 时 5 分被压到 4", applyCeiling(5, ceil({ contentScore: 1 })), 4);
+// 但这条不该碰好作文：content 3 的 c9（13 分）和 content 2 的 c7（6 分）都不动
+eq("content 3 的 13 分不动", applyCeiling(13, ceil({ contentScore: 3 })), 13);
+eq("content 2 的 6 分不动（上限不抬分）", applyCeiling(6, ceil({ contentScore: 2 })), 6);
+eq("多条命中取最严的", ceil({ majorCount: 6, contentScore: 2 })?.maxScore, 6);
+// content 1（上限 4）比 many-major（上限 6）更严，取 4
+eq("多条命中取最严的：文不对题压过大量严重错误", ceil({ majorCount: 6, contentScore: 1 })?.maxScore, 4);
+eq("缺维度分时不误判", ceil({ organizationScore: null, contentScore: null }), null);
+eq("未强制的规则不出现在强制层里", enforcedCeilings(ctx({ organizationScore: 1 })).length, 0);
+
+// 这条是 2026-09 评测里 a3 的复现：模型自己标了 major、language 只给 3/5，
+// 总分却给了 11。上限必须把它压回 8 分档。
+eq("a3 复现：3 条 major 时 11 分被压到 9", applyCeiling(11, ceil({ majorCount: 3 })), 9);
+eq("a3 复现：压完之后落在 8 分档", bandForScore(applyCeiling(11, ceil({ majorCount: 3 }))).label, "8 分档");
+eq("只压不抬：模型给的 0 分不动", applyCeiling(0, ceil({ majorCount: 3 })), 0);
+eq("没上限时分毫不动", applyCeiling(13, ceil()), 13);
+// 1 条 major 的好作文不该被压：a4 在两次运行里分别得到 0 条和 1 条 major
+eq("1 条 major 时 13 分不动（不误伤好作文）", applyCeiling(13, ceil({ majorCount: 1 })), 13);
 
 // ---------------------------------------------------------------------------
 console.log("\n[3] 文本统计");
@@ -619,10 +709,19 @@ function runRateLimitTests() {
  */
 async function runE2E() {
   console.log("\n[12] 端到端：批改编排（mock 掉模型调用，不需要 API key）");
+  // 长度必须过 100 词、段数必须 ≥2，否则会被 lib/rubric.ts 的分数上限拦下来，
+  // 测不到"模型的分数原样传下去"这条链路。原先这里只有 35 词一段，
+  // 加了上限规则之后 fake 的 8 分会被压成 6 分——那不是回归，是那个 fixture
+  // 本来就不该是一次合法的 8 分（8 分档要求"基本切题、表达尚可"）。
   const E2E_ESSAY =
     "Dear Sir, I am a student want to join your volunteer program. " +
     "I very like help other people. Last year I also join a activity about clean the park. " +
-    "I think I have many advantage.";
+    "I think I have many advantage.\n\n" +
+    "First, I am very hardworking and I can do many thing for your program. " +
+    "Second, I have much free time on the weekend, so I can arrive on time every week. " +
+    "I also want to learn more about how to help other people in a right way.\n\n" +
+    "In conclusion, I hope you can give me a chance to join this program. " +
+    "I will try my best to do the work well and I will not let you down.";
 
   const fakeModelOutput = {
     score15: 8,
@@ -708,6 +807,9 @@ async function runE2E() {
     check("user prompt 带上了原文", sentMessages[1].content.includes("I very like help other people."));
     check("user prompt 带上了题目", sentMessages[1].content.includes("apply for a volunteer program"));
     eq("开启了 JSON 输出模式", captured!.body.response_format, { type: "json_object" });
+    // 打分必须可复现：同一篇作文交两次要给同一个分数。0.2 时实测平均波动
+    // 0.75 分/篇、最大 4 分。见 lib/deepseek.ts 的 DEFAULT_TEMPERATURE。
+    eq("temperature 为 0（同一篇作文的分数要可复现）", captured!.body.temperature, 0);
 
     check("meta 记录了模型名", Boolean(result.meta.model), result.meta.model);
     check("meta 记录了耗时", typeof result.meta.elapsedMs === "number");

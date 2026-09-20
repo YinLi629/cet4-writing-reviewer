@@ -12,6 +12,10 @@ dist/
 next-env.d.ts
 .selftest-build/
 
+# 批改质量评测的中间产物：编译输出和跑出来的原始结果（含学生作文，不提交）
+.eval-build/
+.eval-out/
+
 .DS_Store
 Thumbs.db
 .vscode/

@@ -9,7 +9,12 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "selftest": "tsc scripts/selftest.ts --outDir .selftest-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node && node .selftest-build/scripts/selftest.js"
+    "selftest": "tsc scripts/selftest.ts --outDir .selftest-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node && node .selftest-build/scripts/selftest.js",
+    "eval:build": "tsc scripts/eval/run.ts scripts/eval/analyze.ts scripts/eval/show.ts scripts/eval/compare.ts --outDir .eval-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node",
+    "eval": "npm run eval:build && node .eval-build/scripts/eval/run.js",
+    "eval:analyze": "node .eval-build/scripts/eval/analyze.js",
+    "eval:show": "node .eval-build/scripts/eval/show.js",
+    "eval:compare": "node .eval-build/scripts/eval/compare.js"
   },
   "dependencies": {
     "next": "^15.1.0",

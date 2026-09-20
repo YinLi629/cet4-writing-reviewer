@@ -33,6 +33,27 @@ const DEFAULT_MODEL = "deepseek-chat";
  */
 const DEFAULT_TIMEOUT_MS = 100_000;
 
+/**
+ * 0，不是 0.2。这是评测量出来的，不是想当然。
+ *
+ * 2026-09 用同一份代码连着跑了两遍 28 篇语料（lib/prompt 与 lib/rubric 完全未改），
+ * 结果 28 篇里有 13 篇分数变化，平均绝对波动 0.75 分/篇，最大 4 分（c9 13→9）。
+ * 最能说明问题的是 b5：content/language/organization 三项维度分和 major 条数
+ * **逐项完全相同**，总分却从 14 变成 12——分数抖动不是来自模型的诊断，而是
+ * 采样本身。
+ *
+ * 改成 0 之后连跑两遍，波动降到 0.07 和 0.25 分/篇（两个样本），即 3-10 倍
+ * 的改善。**但没有降到 0**：维度分仍会翻（content 4↔3、language 4↔3），所以
+ * 「同一篇作文两次提交拿到同一个分数」还没有完全做到，只能说抖动小了一个
+ * 数量级。剩下的部分来自服务端（批处理、MoE 路由），temperature 管不着。
+ *
+ * 对一个批改网站来说这仍然是产品级问题：同一篇作文交两次、一次 13 分一次 9 分，
+ * 用户没法信任这个分数。temperature 是这里唯一能直接掐掉的随机源，所以取 0。
+ *
+ * 要看实际效果，用 `npm run eval` 连跑两遍，再 `npm run eval:compare` 对比。
+ */
+const DEFAULT_TEMPERATURE = 0;
+
 export function getModel(): string {
   return process.env.DEEPSEEK_MODEL?.trim() || DEFAULT_MODEL;
 }
@@ -132,7 +153,7 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
           { role: "system", content: opts.system },
           { role: "user", content: opts.user },
         ],
-        temperature: opts.temperature ?? 0.2,
+        temperature: opts.temperature ?? DEFAULT_TEMPERATURE,
         max_tokens: opts.maxTokens ?? 4096,
         response_format: { type: "json_object" },
         stream: false,
