@@ -5,6 +5,7 @@
  * 跑法： npm run selftest
  */
 
+import { getAccessCode, hasAccessCode, verifyAccessCode } from "../lib/access";
 import { locateQuote, attachLocations } from "../lib/evidence";
 import { segmentEssay } from "../lib/highlight";
 import { METHOD_LABEL } from "../lib/labels";
@@ -294,7 +295,66 @@ check("报告包含证据锚点", html.includes('id="card-e1"'));
 check("报告样式内联、不引用外部资源", !html.includes("<link") && !html.includes("http://"));
 
 // ---------------------------------------------------------------------------
-console.log("\n[9] 端到端：批改编排（mock 掉模型调用，不需要 API key）");
+console.log("\n[9] 访问口令");
+
+{
+  const originalCode = process.env.REVIEW_ACCESS_CODE;
+  const setCode = (v: string | undefined) => {
+    if (v === undefined) delete process.env.REVIEW_ACCESS_CODE;
+    else process.env.REVIEW_ACCESS_CODE = v;
+  };
+
+  // 没配置时拒绝一切请求，这是刻意的安全默认（宁可坏得明显，也不要静默裸奔）
+  setCode(undefined);
+  eq("未配置口令 → MISSING_CONFIG", verifyAccessCode("whatever"), {
+    ok: false,
+    reason: "MISSING_CONFIG",
+  });
+  check("未配置口令 → hasAccessCode() 为假", !hasAccessCode());
+
+  // 占位值必须等同于没配，否则口令形同虚设
+  setCode("change-me-please");
+  eq("占位口令 → MISSING_CONFIG", verifyAccessCode("change-me-please"), {
+    ok: false,
+    reason: "MISSING_CONFIG",
+  });
+
+  setCode("correct-horse-battery-staple");
+  check("已配置口令 → hasAccessCode() 为真", hasAccessCode());
+  eq("正确口令通过", verifyAccessCode("correct-horse-battery-staple"), { ok: true });
+  eq("错误口令被拒", verifyAccessCode("wrong"), { ok: false, reason: "INVALID" });
+  eq("空字符串被拒", verifyAccessCode(""), { ok: false, reason: "INVALID" });
+  eq("大小写不同被拒", verifyAccessCode("Correct-Horse-Battery-Staple"), {
+    ok: false,
+    reason: "INVALID",
+  });
+  eq("带尾随空格被拒", verifyAccessCode("correct-horse-battery-staple "), {
+    ok: false,
+    reason: "INVALID",
+  });
+
+  // 非字符串入参不能被 String() 之类的隐式转换放行
+  eq("undefined 被拒", verifyAccessCode(undefined), { ok: false, reason: "INVALID" });
+  eq("null 被拒", verifyAccessCode(null), { ok: false, reason: "INVALID" });
+  eq("数字被拒", verifyAccessCode(123), { ok: false, reason: "INVALID" });
+  eq("对象被拒", verifyAccessCode({}), { ok: false, reason: "INVALID" });
+  eq("数组被拒", verifyAccessCode(["correct-horse-battery-staple"]), {
+    ok: false,
+    reason: "INVALID",
+  });
+
+  // 配置值自身的首尾空白要裁掉：从 Vercel 界面粘贴时很容易多带一个换行，
+  // 那种情况下站点会莫名其妙地拒绝所有正确口令，很难排查
+  setCode("  padded-code  ");
+  check("配置值的首尾空白被裁剪", getAccessCode() === "padded-code", getAccessCode());
+  eq("裁剪后能匹配", verifyAccessCode("padded-code"), { ok: true });
+
+  setCode(originalCode);
+}
+
+// ---------------------------------------------------------------------------
+// 这一组是异步的，放在最后跑，避免它的结果插在同步分组中间
+console.log("\n[10] 端到端：批改编排（mock 掉模型调用，不需要 API key）");
 
 /**
  * 这一段验证的是整条关键路径：构建 prompt → 调模型 → 解析 → 证据定位 →

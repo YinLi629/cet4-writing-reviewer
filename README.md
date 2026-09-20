@@ -18,7 +18,7 @@
 ```bash
 npm install
 cp .env.local.example .env.local   # Windows: copy .env.local.example .env.local
-# 编辑 .env.local，填入 DEEPSEEK_API_KEY
+# 编辑 .env.local，填入 DEEPSEEK_API_KEY 和 REVIEW_ACCESS_CODE
 npm run dev
 ```
 
@@ -37,14 +37,32 @@ npm run build       # 生产构建
 `npm run selftest` 覆盖了证据定位、档次查表、分数折算、高亮切分、HTML 转义（XSS）、
 模型输出的防御性解析，以及一条 mock 掉模型调用的端到端流程。改完代码先跑它。
 
+## 访问口令
+
+`POST /api/review` 烧的是站长自己的模型额度，所以加了一道共享口令：请求必须带上与服务端
+`REVIEW_ACCESS_CODE` 一致的口令才能批改。
+
+**没配 `REVIEW_ACCESS_CODE` 时，服务端拒绝一切批改请求**，不会静默放行。这是刻意的——
+公开站点上「忘了配所以裸奔」的代价太大，宁可让它坏得明显。输入页会在这种情况下提前提示，
+而不是让你写完作文才报错。
+
+口令在输入页输入一次后记在浏览器 localStorage 里，之后免输。只有口令**正确**时才会被记住，
+输错不会被持久化，免得下次预填一个错的值。
+
+轮换口令：改环境变量（线上改 Vercel 的环境变量）然后重启 / 重新部署，不需要改代码。
+口令建议用长随机串，因为**没有对失败次数做限制**，`1234` 这种会被撞开。
+
+校验在路由层（`app/api/review/route.ts`），核心逻辑是 `lib/access.ts` 里的纯函数，
+比对用 `timingSafeEqual`（先各自 SHA-256 摘要再比，避免长度不等时抛错，也不泄露口令长度）。
+
 ## 页面与接口
 
 | 路径 | 说明 |
 | --- | --- |
 | `/` | 作文输入页：题目、正文、目标档次、实时字数、示例填充 |
 | `/result` | 结果展示页：档次、分数、总评、维度诊断、升档建议、证据溯源、原文批注 |
-| `POST /api/review` | 批改接口。入参 `{ essay, topic?, targetBandLevel? }` |
-| `GET /api/review` | 探活。返回 `{ ready, model }`，输入页据此提前提示缺 key |
+| `POST /api/review` | 批改接口。入参 `{ essay, topic?, targetBandLevel?, accessCode? }` |
+| `GET /api/review` | 探活。返回 `{ ready, gated, model }`，输入页据此提前提示缺 key / 缺口令 |
 
 结果页的数据来自 `sessionStorage`，不落库。关掉标签页就没了，作文不会留在服务器上。
 代价是不能跨标签页分享结果——真要做分享，得改成服务端存储 + 短 id。
@@ -99,6 +117,7 @@ lib/
   rubric.ts                四级评分标准：档次表、查表、折算、档间差距
   prompt.ts                ★ 批改提示词 —— 要换标准就改这里
   deepseek.ts              DeepSeek 客户端（原生 fetch，无 SDK 依赖）
+  access.ts                访问口令：读取配置 + timingSafeEqual 校验
   review.ts                编排层：模型输出 → 可靠结果
   evidence.ts              证据定位（逐字/归一化/分段/模糊）
   highlight.ts             高亮切分（网页与报告共用，保证两边一致）

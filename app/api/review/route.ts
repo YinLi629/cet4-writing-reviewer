@@ -1,12 +1,16 @@
 /**
  * POST /api/review —— 批改入口。
  *
- * 这个路由只做三件事：读请求、调 lib/review、把错误翻译成合适的状态码。
- * 所有业务逻辑都在 lib/ 里，路由本身保持薄。
+ * 这个路由只做四件事：读请求、校验访问口令、调 lib/review、把错误翻译成
+ * 合适的状态码。所有业务逻辑都在 lib/ 里，路由本身保持薄。
+ *
+ * 口令校验放这一层而不是 lib/review.ts：批改逻辑不该关心鉴权，而且
+ * scripts/selftest.ts 的端到端用例是直接调 reviewEssay() 的，塞进去会带崩它们。
  */
 
 import { NextResponse } from "next/server";
 
+import { hasAccessCode, verifyAccessCode } from "@/lib/access";
 import { getModel, hasApiKey, LLMError } from "@/lib/deepseek";
 import { reviewEssay } from "@/lib/review";
 import type { ReviewErrorResponse } from "@/lib/types";
@@ -21,8 +25,11 @@ function statusFor(code: ReviewErrorResponse["code"]): number {
     case "INVALID_INPUT":
       return 400;
     case "MISSING_API_KEY":
-      // 是服务端配置问题，不是调用方的错
+    case "MISSING_ACCESS_CODE":
+      // 都是服务端配置问题，不是调用方的错
       return 500;
+    case "INVALID_ACCESS_CODE":
+      return 401;
     case "TIMEOUT":
       return 504;
     case "UPSTREAM_ERROR":
@@ -41,6 +48,25 @@ export async function POST(request: Request) {
     return NextResponse.json<ReviewErrorResponse>(
       { error: "请求体不是合法 JSON。", code: "INVALID_INPUT" },
       { status: 400 },
+    );
+  }
+
+  // 先验口令，再谈批改——没通过就别浪费模型额度
+  const verdict = verifyAccessCode(
+    (body as { accessCode?: unknown } | null)?.accessCode,
+  );
+  if (!verdict.ok) {
+    const code =
+      verdict.reason === "MISSING_CONFIG" ? "MISSING_ACCESS_CODE" : "INVALID_ACCESS_CODE";
+    return NextResponse.json<ReviewErrorResponse>(
+      {
+        error:
+          code === "MISSING_ACCESS_CODE"
+            ? "服务端没有配置访问口令，批改功能暂不可用。请在环境变量里设置 REVIEW_ACCESS_CODE 后重启或重新部署。"
+            : "访问口令不正确。请检查后重试。",
+        code,
+      },
+      { status: statusFor(code) },
     );
   }
 
@@ -77,6 +103,8 @@ export async function GET() {
   return NextResponse.json(
     {
       ready: hasApiKey(),
+      // 没配口令时服务端会拒绝一切批改，输入页据此提前提示
+      gated: hasAccessCode(),
       model: getModel(),
     },
     { headers: { "Cache-Control": "no-store" } },

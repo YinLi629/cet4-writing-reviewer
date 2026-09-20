@@ -137,6 +137,8 @@ export interface ReviewRequest {
   topic?: string;
   /** 目标档次，选填。用于生成"从当前档到目标档"的升档路径 */
   targetBandLevel?: number;
+  /** 访问口令。服务端用 REVIEW_ACCESS_CODE 校验，没配就拒绝一切请求。 */
+  accessCode?: string;
 }
 
 /** POST /api/review 的错误响应 */
@@ -145,6 +147,8 @@ export interface ReviewErrorResponse {
   /** 便于前端区分处理 */
   code:
     | "MISSING_API_KEY"
+    | "MISSING_ACCESS_CODE"
+    | "INVALID_ACCESS_CODE"
     | "INVALID_INPUT"
     | "UPSTREAM_ERROR"
     | "BAD_MODEL_OUTPUT"

@@ -6,6 +6,9 @@
  * 关掉标签页，作文就没了，对用户反而是好事。
  *
  * 代价是结果不能跨标签页分享。真要做分享功能，应该改成服务端存储 + 短 id。
+ *
+ * 唯一的例外是访问口令：它用 localStorage，因为口令是用户自己持有的凭据、
+ * 不是批改产物，「关掉标签页就没了」在这里反而是折磨。
  */
 
 import type { ReviewResult } from "./types";
@@ -27,6 +30,46 @@ function storage(): Storage | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 访问口令是唯一用 localStorage 的东西——见文件头部的说明。
+ *
+ * 口令不是敏感到这个地步的东西：它挡的是"随手扫到站点的人"，不是拿到过
+ * 这台电脑的人。所以存 localStorage 换取免重输是划算的。
+ */
+const ACCESS_CODE_KEY = "cet4-review:access-code";
+
+/** 和 storage() 同样的防护：SSR 下不存在，隐私模式下可能抛异常 */
+function localStore(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const s = window.localStorage;
+    const probe = "__probe__";
+    s.setItem(probe, "1");
+    s.removeItem(probe);
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+export function saveAccessCode(code: string): void {
+  const s = localStore();
+  if (!s) return;
+  try {
+    s.setItem(ACCESS_CODE_KEY, code);
+  } catch {
+    // 存不下就算了，下次重输一遍而已，不阻断主流程
+  }
+}
+
+export function loadAccessCode(): string | null {
+  return localStore()?.getItem(ACCESS_CODE_KEY) ?? null;
+}
+
+export function clearAccessCode(): void {
+  localStore()?.removeItem(ACCESS_CODE_KEY);
 }
 
 export function saveResult(result: ReviewResult): void {

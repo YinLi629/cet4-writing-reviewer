@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { BANDS } from "@/lib/rubric";
 import { SAMPLE_ESSAYS } from "@/lib/samples";
-import { pushHistory, saveResult } from "@/lib/store";
+import { loadAccessCode, pushHistory, saveAccessCode, saveResult } from "@/lib/store";
 import { countEnglishWords } from "@/lib/text-stats";
 import type { ReviewErrorResponse, ReviewResult } from "@/lib/types";
 
@@ -24,18 +24,26 @@ export function EssayForm() {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<{ message: string; code?: string } | null>(null);
   const [apiReady, setApiReady] = useState<boolean | null>(null);
+  const [gated, setGated] = useState<boolean | null>(null);
+  const [accessCode, setAccessCode] = useState("");
   const [modelName, setModelName] = useState<string>("");
 
   const abortRef = useRef<AbortController | null>(null);
 
-  // 提前问一下服务端有没有配 key，别让用户写完作文才发现跑不起来
+  // 口令是记住的，下次访问直接预填，不用重输
+  useEffect(() => {
+    setAccessCode(loadAccessCode() ?? "");
+  }, []);
+
+  // 提前问一下服务端有没有配 key 和口令，别让用户写完作文才发现跑不起来
   useEffect(() => {
     let cancelled = false;
     fetch("/api/review")
       .then((r) => r.json())
-      .then((d: { ready?: boolean; model?: string }) => {
+      .then((d: { ready?: boolean; gated?: boolean; model?: string }) => {
         if (cancelled) return;
         setApiReady(Boolean(d.ready));
+        setGated(Boolean(d.gated));
         setModelName(d.model ?? "");
       })
       .catch(() => {
@@ -70,6 +78,7 @@ export function EssayForm() {
           essay,
           topic: topic.trim() || undefined,
           targetBandLevel: targetBandLevel ? Number(targetBandLevel) : undefined,
+          accessCode: accessCode.trim() || undefined,
         }),
         signal: controller.signal,
       });
@@ -89,6 +98,9 @@ export function EssayForm() {
       }
 
       const result = payload as ReviewResult;
+      // 只在真的批改成功后才记住口令——口令错了就不该被持久化，
+      // 否则下次访问会预填一个错的值
+      if (accessCode.trim()) saveAccessCode(accessCode.trim());
       saveResult(result);
       pushHistory(result);
       router.push("/result");
@@ -121,10 +133,25 @@ export function EssayForm() {
         </div>
       )}
 
+      {gated === false && (
+        <div className="alert alert-error">
+          <strong>服务端还没有配置访问口令</strong>
+          在环境变量里设置 <code>REVIEW_ACCESS_CODE</code>
+          ——本地写进 <code>.env.local</code>，线上写进 Vercel 的环境变量，然后重启或重新部署。
+          出于安全考虑，没配口令时服务端会拒绝一切批改请求。
+        </div>
+      )}
+
       {error && (
         <div className="alert alert-error">
           <strong>批改失败</strong>
           {error.message}
+          {error.code === "INVALID_ACCESS_CODE" && (
+            <div style={{ marginTop: 6 }}>
+              检查一下上面的「访问口令」是否与服务端配置的{" "}
+              <code>REVIEW_ACCESS_CODE</code> 一致。
+            </div>
+          )}
           {error.code === "TIMEOUT" && (
             <div style={{ marginTop: 6 }}>
               作文字数越多耗时越长，可以调大 <code>.env.local</code> 里的{" "}
@@ -133,6 +160,26 @@ export function EssayForm() {
           )}
         </div>
       )}
+
+      <div className="field">
+        <label htmlFor="accessCode">
+          访问口令
+          <span className="hint">
+            站点的批改额度有限，需要口令才能用。输入一次后会记在这个浏览器上
+          </span>
+        </label>
+        <input
+          id="accessCode"
+          className="input"
+          type="password"
+          autoComplete="off"
+          style={{ maxWidth: 320 }}
+          placeholder="向站点主人索取"
+          value={accessCode}
+          onChange={(e) => setAccessCode(e.target.value)}
+          disabled={pending}
+        />
+      </div>
 
       <div className="field">
         <label htmlFor="topic">
