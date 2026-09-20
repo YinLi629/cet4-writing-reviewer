@@ -1,0 +1,25 @@
+{
+  "name": "cet4-writing-reviewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "四级作文批改网站：档次判定、分数折算、证据溯源、升档建议、HTML 批改报告",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "selftest": "tsc scripts/selftest.ts --outDir .selftest-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node && node .selftest-build/scripts/selftest.js"
+  },
+  "dependencies": {
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}
