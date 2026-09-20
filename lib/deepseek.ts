@@ -24,7 +24,14 @@ export class LLMError extends Error {
 
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-chat";
-const DEFAULT_TIMEOUT_MS = 120_000;
+/**
+ * 100 秒，比 app/api/review/route.ts 的 maxDuration = 120 秒少 20 秒。
+ *
+ * 这个差值不能省：模型在第 99 秒返回后，还要解析输出、定位证据（逐条在原文里
+ * 找）、组织响应，这些都要时间。两者相等的话，平台会在我们收尾时把函数掐掉，
+ * 用户只看到一个平台级报错，而额度已经花掉了。
+ */
+const DEFAULT_TIMEOUT_MS = 100_000;
 
 export function getModel(): string {
   return process.env.DEEPSEEK_MODEL?.trim() || DEFAULT_MODEL;
@@ -65,6 +72,11 @@ export interface ChatJSONOptions {
   maxTokens?: number;
   /** 覆盖默认模型，一般不用传 */
   model?: string;
+  /**
+   * 调用方的中止信号（路由传的是 request.signal）。用户关标签页 / 刷新时，
+   * 上游调用会被一起掐掉，不再为一个没人在收的响应继续烧额度。
+   */
+  signal?: AbortSignal;
 }
 
 export interface ChatJSONResult<T> {
@@ -97,6 +109,15 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), getTimeoutMs());
 
+  // 把调用方的信号并进同一个 controller。手写而不用 AbortSignal.any：
+  // 后者要 Node 20.3+，而 Next 15 只要求 Node 18，不值得为一个便利方法抬版本门槛。
+  const external = opts.signal;
+  const onExternalAbort = () => controller.abort();
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener("abort", onExternalAbort, { once: true });
+  }
+
   let res: Response;
   try {
     res = await fetch(`${getBaseUrl()}/chat/completions`, {
@@ -121,26 +142,38 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
   } catch (err) {
     clearTimeout(timeout);
     if (err instanceof Error && err.name === "AbortError") {
+      // 分清是谁掐的。客户端先断开时不能报超时——既误导用户，也会把
+      // "用户自己关页面"记成服务端故障
+      if (external?.aborted) {
+        throw new LLMError("CLIENT_ABORTED", "客户端已断开连接，批改已中止。");
+      }
       throw new LLMError(
         "TIMEOUT",
         `批改超时（超过 ${Math.round(getTimeoutMs() / 1000)} 秒）。可以调大 .env.local 里的 REVIEW_TIMEOUT_MS，或换一篇短一点的作文。`,
       );
     }
+    // 网络层细节只进服务端日志，不透给客户端
+    console.error("[deepseek] 请求模型服务失败：", err);
     throw new LLMError(
       "UPSTREAM_ERROR",
-      `无法连接到模型服务：${err instanceof Error ? err.message : String(err)}`,
+      "无法连接到模型服务。请检查服务端网络与 DEEPSEEK_BASE_URL 配置，详情见服务端日志。",
     );
   } finally {
     clearTimeout(timeout);
+    external?.removeEventListener("abort", onExternalAbort);
   }
 
   if (!res.ok) {
-    // 把上游的错误信息透出来，但绝不回显 api key
+    // 上游的错误响应只进服务端日志。里面可能有余额提示、代理调试信息、
+    // 请求 id 之类不该给匿名调用方看的东西
     const bodyText = await res.text().catch(() => "");
-    const snippet = bodyText.slice(0, 500);
+    console.error(`[deepseek] 上游返回 ${res.status}：`, bodyText.slice(0, 1000));
+
     throw new LLMError(
       "UPSTREAM_ERROR",
-      `模型服务返回 ${res.status}。${snippet ? `响应：${snippet}` : ""}`,
+      res.status === 401 || res.status === 403
+        ? "模型服务拒绝了这次调用（鉴权失败）。多半是服务端的 DEEPSEEK_API_KEY 无效或已过期，请检查配置。"
+        : "模型服务返回了错误，批改未能完成。请稍后重试；若持续失败请查看服务端日志。",
       res.status,
     );
   }
@@ -176,8 +209,9 @@ export function extractJson<T>(raw: string): T {
 
   const attempts: string[] = [trimmed];
 
-  // 剥掉 ```json ... ``` 包裹
-  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  // 剥掉 ```json ... ``` 包裹。这里刻意不在捕获组两侧写 \s*：
+  // 贪婪 \s* 夹一个懒惰组是经典的二次回溯形状，空白交给后面的 trim() 处理就够了
+  const fence = trimmed.match(/```(?:json)?([\s\S]*?)```/);
   if (fence?.[1]) attempts.push(fence[1].trim());
 
   // 截取第一个 { 到最后一个 }
@@ -196,8 +230,15 @@ export function extractJson<T>(raw: string): T {
     }
   }
 
+  // 日志里只留开头一小段：模型输出的主体是作文引文，全文写进日志就等于
+  // 把学生作文落到了服务端磁盘上，和 README 承诺的"不落库"相悖。
+  // 开头这几十字符足以判断"是不是又包了层代码块/加了句客套话"。
+  console.error(
+    `[deepseek] 模型输出不是合法 JSON（${trimmed.length} 字符，开头：${trimmed.slice(0, 80).replace(/\s+/g, " ")}）`,
+  );
+
   throw new LLMError(
     "BAD_MODEL_OUTPUT",
-    `模型没有返回合法 JSON。原始输出前 300 字：${trimmed.slice(0, 300)}`,
+    "模型没有返回可解析的 JSON，批改未能完成。这通常重试一次就好；若持续出现请查看服务端日志。",
   );
 }

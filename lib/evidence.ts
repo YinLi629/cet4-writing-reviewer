@@ -51,6 +51,15 @@ const ELLIPSIS_RE = /\.\s*\.\s*\.|…|…|\[\.\.\.\]|\(\.\.\.\)/;
 const FUZZY_THRESHOLD = 0.8;
 
 /**
+ * 省略号分段的最多段数。
+ *
+ * 每段都要单独定位一次（逐字找不到时还要重建一遍归一化映射），
+ * 不加限制的话，一条塞满省略号的超长引文能把这里放大成平方级的开销。
+ * 20 段已经远超正常引用会有的断点数量，超过就说明这条引文本身没意义了。
+ */
+const MAX_FRAGMENTS = 20;
+
+/**
  * 把一段文本归一化，并保留"归一化后的第 i 个字符 → 原文下标"的映射。
  * 映射是能反查回原文坐标的关键。
  */
@@ -72,8 +81,15 @@ function normalizeWithMap(s: string): { norm: string; map: number[] } {
       continue;
     }
 
-    chars.push(mapped.toLowerCase());
-    map.push(i);
+    // 小写化未必是 1:1 的：İ(U+0130) 的 toLowerCase() 是 "i̇"（i + 组合点，
+    // 2 个 code unit）。所以不能只 push 一次——否则 chars 比 map 长，
+    // 两数组错位，后面用 map[h + len - 1] 反查坐标时会整体漂移
+    // （画出来的高亮会错位，而且不报错）。
+    const lower = mapped.toLowerCase();
+    for (let k = 0; k < lower.length; k++) {
+      chars.push(lower[k]);
+      map.push(i);
+    }
     prevWasSpace = false;
   }
 
@@ -85,13 +101,22 @@ function normalizeWithMap(s: string): { norm: string; map: number[] } {
   return { norm: chars.join(""), map };
 }
 
+/**
+ * 成对包裹引号：两端各一个引号字符，中间是内容。
+ *
+ * 刻意写成"两端各一个单字符类，中间贪婪"：原来的写法中间用懒惰的 `[\s\S]*?`、
+ * 两侧再各夹一个贪婪的 `\s*`，那是典型的二次回溯形状（全文唯一一处）。
+ * 现在空白交给 trim()，正则本身没有歧义，是线性的。
+ */
+const WRAPPED_QUOTE_RE = /^["'“”‘’]([\s\S]*)["'“”‘’]$/;
+
 /** 清洗模型给的引文：去掉它自作主张包上的引号和两端省略号 */
 function cleanQuote(raw: string): string {
   let q = raw.trim();
   // 去掉成对的包裹引号，最多剥两层
   for (let i = 0; i < 2; i++) {
-    const m = q.match(/^["'“”‘’“”‘’]\s*([\s\S]*?)\s*["'“”‘’“”‘’]$/);
-    if (m && m[1]) q = m[1].trim();
+    const inner = q.match(WRAPPED_QUOTE_RE)?.[1]?.trim();
+    if (inner) q = inner;
     else break;
   }
   // 去掉两端的省略号
@@ -163,6 +188,10 @@ export function locateQuote(
     .filter((f) => f.length >= 2);
 
   if (fragments.length > 1) {
+    // 段落太多直接放弃定位，见 MAX_FRAGMENTS 的注释。
+    // 返回"未能定位"而不是硬算：报告里会如实标出来，好过卡上几秒
+    if (fragments.length > MAX_FRAGMENTS) return NOT_FOUND;
+
     const spans: Array<[number, number]> = [];
     for (const frag of fragments) {
       const hit = locateSingle(essay, frag, spans);

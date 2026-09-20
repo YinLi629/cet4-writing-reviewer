@@ -29,6 +29,10 @@ import {
 import {
   DIMENSION_LABEL,
   DIMENSIONS,
+  MAX_ESSAY_CHARS,
+  MAX_QUOTE_CHARS,
+  MAX_TOPIC_CHARS,
+  MIN_ESSAY_CHARS,
   type Dimension,
   type DimensionScore,
   type Evidence,
@@ -38,10 +42,9 @@ import {
   type UpgradeAction,
 } from "./types";
 
-/** 少于这么多字符就不当作文处理了 */
-export const MIN_ESSAY_CHARS = 20;
-/** 上限，防止有人传一本书进来把额度烧光 */
-export const MAX_ESSAY_CHARS = 8000;
+// 上限的定义搬到了 lib/types.ts（输入页也要用同一组数字，而那里是客户端
+// 可以安全导入的）。这里转出去，保持既有的 import 路径不变。
+export { MAX_ESSAY_CHARS, MAX_QUOTE_CHARS, MAX_TOPIC_CHARS, MIN_ESSAY_CHARS };
 
 export interface NormalizedInput {
   essay: string;
@@ -68,9 +71,17 @@ export function normalizeInput(body: ReviewRequest): NormalizedInput {
     );
   }
 
+  const topic = typeof body?.topic === "string" ? body.topic.trim() : "";
+  if (topic.length > MAX_TOPIC_CHARS) {
+    throw new LLMError(
+      "INVALID_INPUT",
+      `题目太长了（${topic.length} 字符），上限 ${MAX_TOPIC_CHARS} 字符。题目只写题干即可，全文请放进作文正文。`,
+    );
+  }
+
   return {
     essay,
-    topic: typeof body?.topic === "string" ? body.topic.trim() : "",
+    topic,
     targetBandLevel: isValidBandLevel(body?.targetBandLevel)
       ? body.targetBandLevel
       : undefined,
@@ -136,6 +147,9 @@ function parseEvidence(v: unknown): RawEvidenceItem[] {
     const quote = asString(o.quote);
     // 没有 quote 的证据直接丢弃——证据溯源里没有原文就不成立
     if (quote.length < 2) continue;
+    // 超长引文也丢弃。见 MAX_QUOTE_CHARS 的注释：这是性能护栏，
+    // 而且定位一个几百字符的"片段"本来也定位不出什么有意义的东西
+    if (quote.length > MAX_QUOTE_CHARS) continue;
 
     const dimension = asDimension(o.dimension);
     if (!dimension) continue;
@@ -288,8 +302,14 @@ function kindWeight(kind: EvidenceKind): number {
 // 主流程
 // ---------------------------------------------------------------------------
 
+/**
+ * @param signal 调用方的中止信号（路由传的是 request.signal）。用户关掉标签页
+ *   或刷新时，模型调用会被一起中止，不再为一个没人在等的响应继续计费。
+ *   自测直接调用时可以不传。
+ */
 export async function reviewEssay(
   body: ReviewRequest,
+  signal?: AbortSignal,
 ): Promise<ReviewResult> {
   const input = normalizeInput(body);
   const warnings: string[] = [];
@@ -301,7 +321,7 @@ export async function reviewEssay(
     targetBandLevel: input.targetBandLevel,
   });
 
-  const call = await chatJSON<Record<string, unknown>>({ system, user });
+  const call = await chatJSON<Record<string, unknown>>({ system, user, signal });
   const raw = call.data;
 
   // 1) 分数与档次：分数来自模型，档次由代码查表

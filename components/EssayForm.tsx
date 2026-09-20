@@ -7,7 +7,13 @@ import { BANDS } from "@/lib/rubric";
 import { SAMPLE_ESSAYS } from "@/lib/samples";
 import { loadAccessCode, pushHistory, saveAccessCode, saveResult } from "@/lib/store";
 import { countEnglishWords } from "@/lib/text-stats";
-import type { ReviewErrorResponse, ReviewResult } from "@/lib/types";
+import {
+  MAX_ESSAY_CHARS,
+  MAX_TOPIC_CHARS,
+  MIN_ESSAY_CHARS,
+  type ReviewErrorResponse,
+  type ReviewResult,
+} from "@/lib/types";
 
 import { LoadingStages } from "./LoadingStages";
 
@@ -58,7 +64,11 @@ export function EssayForm() {
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const wordCount = useMemo(() => countEnglishWords(essay), [essay]);
-  const tooShort = essay.trim().length > 0 && essay.trim().length < 20;
+  const tooShort =
+    essay.trim().length > 0 && essay.trim().length < MIN_ESSAY_CHARS;
+  // 不给 essay 加 maxLength：粘贴超长文本时被静默截断比报错更糟，
+  // 这里只提前提示，让服务端返回那条说明清楚的上限错误
+  const tooLong = essay.length > MAX_ESSAY_CHARS;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -184,7 +194,9 @@ export function EssayForm() {
       <div className="field">
         <label htmlFor="topic">
           题目 / 要求
-          <span className="hint">选填，但填了才能判断是否切题</span>
+          <span className="hint">
+            选填，但填了才能判断是否切题。只写题干，上限 {MAX_TOPIC_CHARS} 字符
+          </span>
         </label>
         <textarea
           id="topic"
@@ -193,6 +205,7 @@ export function EssayForm() {
           placeholder="例如：Suppose you are a student who wants to join a volunteer program. Write a letter to the program organizer to apply for it. You should write at least 120 words."
           value={topic}
           onChange={(e) => setTopic(e.target.value)}
+          maxLength={MAX_TOPIC_CHARS}
           disabled={pending}
         />
       </div>
@@ -264,10 +277,16 @@ export function EssayForm() {
         <button
           type="submit"
           className="btn btn-primary btn-lg"
-          disabled={pending || tooShort || !essay.trim()}
+          disabled={pending || tooShort || tooLong || !essay.trim()}
         >
           开始批改
         </button>
+
+        {tooLong && (
+          <span className="counter counter-warn">
+            超过 {MAX_ESSAY_CHARS} 字符上限，请删减后再提交
+          </span>
+        )}
 
         <span className={`counter${essay && (wordCount < TARGET_MIN || wordCount > TARGET_MAX) ? " counter-warn" : ""}`}>
           {wordCount} 词

@@ -130,6 +130,29 @@ export interface ReviewResult {
   };
 }
 
+/**
+ * 输入长度上限。
+ *
+ * 放在这个文件而不是 lib/review.ts，是因为输入页（客户端组件）也要用同一组
+ * 数字来限制输入。从 review.ts 导入的话，客户端组件为了一个整数会把整个编排层
+ * ——包括模型客户端和整份提示词——拉进浏览器包里。
+ */
+export const MIN_ESSAY_CHARS = 20;
+export const MAX_ESSAY_CHARS = 8000;
+/**
+ * 题目上限。题目会原样进 prompt，不限的话 token 成本成倍放大；
+ * 而且题目比作文正文更适合藏提示注入（学生没理由往题目里写几千字）。
+ */
+export const MAX_TOPIC_CHARS = 1000;
+/**
+ * 单条证据引文的长度上限，只给服务端用。
+ *
+ * 这是**性能护栏**，不是为了好看：证据定位的模糊匹配是平方量级的，
+ * 超长引文能让它从毫秒涨到秒。而 500 字符以上的"证据片段"本来也失去了
+ * 引用价值——那不是"一处原文"，那是一整段。
+ */
+export const MAX_QUOTE_CHARS = 500;
+
 /** POST /api/review 的请求体 */
 export interface ReviewRequest {
   essay: string;
@@ -150,8 +173,12 @@ export interface ReviewErrorResponse {
     | "MISSING_ACCESS_CODE"
     | "INVALID_ACCESS_CODE"
     | "INVALID_INPUT"
+    | "PAYLOAD_TOO_LARGE"
+    | "RATE_LIMITED"
     | "UPSTREAM_ERROR"
     | "BAD_MODEL_OUTPUT"
     | "TIMEOUT"
+    /** 客户端在批改完成前自己断开了，响应没人收 */
+    | "CLIENT_ABORTED"
     | "UNKNOWN";
 }
