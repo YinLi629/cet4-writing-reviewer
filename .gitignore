@@ -26,3 +26,10 @@ Thumbs.db
 
 npm-debug.log*
 yarn-error.log*
+
+.vercel
+
+# vercel link 加的是宽泛的 `.env*`，那会把该被跟踪的模板也盖住，收紧成显式两条
+.env
+.env*.local
+!.env.local.example
