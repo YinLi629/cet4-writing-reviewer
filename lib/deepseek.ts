@@ -151,7 +151,9 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
   const timeout = setTimeout(() => controller.abort(), getTimeoutMs());
 
   // 把调用方的信号并进同一个 controller。手写而不用 AbortSignal.any：
-  // 后者要 Node 20.3+，而 Next 15 只要求 Node 18，不值得为一个便利方法抬版本门槛。
+  // 后者要 Node 20.3+。项目现在的最低版本是 19（package.json 的 engines，
+  // 被 @neondatabase/serverless 逼上来的），仍然够不着那个方法；而且手写这版
+  // 能在 finally 里 removeEventListener，AbortSignal.any 没有对应的撤销方式。
   const external = opts.signal;
   const onExternalAbort = () => controller.abort();
   if (external) {

@@ -7,7 +7,6 @@ import { SAMPLE_ESSAYS } from "@/lib/samples";
 import { loadAccessCode } from "@/lib/store";
 import { countEnglishWords } from "@/lib/text-stats";
 import {
-  MAX_ESSAY_CHARS,
   MAX_TOPIC_CHARS,
   MIN_ESSAY_CHARS,
   type ReviewRequest,
@@ -26,6 +25,7 @@ export function EssayForm() {
   const [targetBandLevel, setTargetBandLevel] = useState<string>("");
   const [apiReady, setApiReady] = useState<boolean | null>(null);
   const [gated, setGated] = useState<boolean | null>(null);
+  const [persistence, setPersistence] = useState<"postgres" | "memory" | null>(null);
   const [accessCode, setAccessCode] = useState("");
 
   // 一次批改的完整生命周期（请求、流式增量、终止态、跳转）都在这个 hook 里，
@@ -46,10 +46,14 @@ export function EssayForm() {
     let cancelled = false;
     fetch("/api/review")
       .then((r) => r.json())
-      .then((d: { ready?: boolean; gated?: boolean }) => {
+      .then((d: { ready?: boolean; gated?: boolean; persistence?: string }) => {
         if (cancelled) return;
         setApiReady(Boolean(d.ready));
         setGated(Boolean(d.gated));
+        // 只认这两个明确的值。字段缺失（比如前端是新的、后端还是旧的）时不显示
+        // 提示——宁可少提示，也不能凭一个 undefined 就说"限流没生效"吓人
+        const mode = d.persistence;
+        setPersistence(mode === "postgres" || mode === "memory" ? mode : null);
       })
       .catch(() => {
         if (!cancelled) setApiReady(null);
@@ -62,9 +66,8 @@ export function EssayForm() {
   const wordCount = useMemo(() => countEnglishWords(essay), [essay]);
   const tooShort =
     essay.trim().length > 0 && essay.trim().length < MIN_ESSAY_CHARS;
-  // 不给 essay 加 maxLength：粘贴超长文本时被静默截断比报错更糟，
-  // 这里只提前提示，让服务端返回那条说明清楚的上限错误
-  const tooLong = essay.length > MAX_ESSAY_CHARS;
+  // 没有 tooLong：作文不限字数。唯一还能拦住超长输入的是服务端的 128 KB
+  // 请求体上限，那是异常情况，不值得在表单里提前吓唬人。
 
   const buildRequest = (): ReviewRequest => ({
     essay,
@@ -115,18 +118,31 @@ export function EssayForm() {
         </div>
       )}
 
+      {/* 用 warn 而不是 error：站点照常能用，退化的只是限流的强度。
+          两种原因都走这里：没配 DATABASE_URL，或者配了但数据库连不上 */}
+      {persistence === "memory" && (
+        <div className="alert alert-warn">
+          <strong>限流的持久化存储没有生效</strong>
+          服务端现在把限流状态存在单个实例的内存里，要么是没配{" "}
+          <code>DATABASE_URL</code>
+          ，要么是数据库连不上（后一种情况服务端日志里有一条告警）。本地开发无所谓，
+          线上这样部署会让这道限制漏掉。在 Vercel 的环境变量里配好{" "}
+          <code>DATABASE_URL</code> 后重新部署。
+        </div>
+      )}
+
       {error && (
         <div className="alert alert-error">
           <strong>批改失败</strong>
           {error.message}
           {error.code === "INVALID_ACCESS_CODE" && (
-            <div style={{ marginTop: 6 }}>
+            <div className="alert-detail">
               检查一下上面的「访问口令」是否与服务端配置的{" "}
               <code>REVIEW_ACCESS_CODE</code> 一致。
             </div>
           )}
           {error.code === "TIMEOUT" && (
-            <div style={{ marginTop: 6 }}>
+            <div className="alert-detail">
               作文字数越多耗时越长，可以调大 <code>.env.local</code> 里的{" "}
               <code>REVIEW_TIMEOUT_MS</code>。
             </div>
@@ -143,10 +159,9 @@ export function EssayForm() {
         </label>
         <input
           id="accessCode"
-          className="input"
+          className="input field-narrow"
           type="password"
           autoComplete="off"
-          style={{ maxWidth: 320 }}
           placeholder="向站点主人索取"
           value={accessCode}
           onChange={(e) => setAccessCode(e.target.value)}
@@ -163,8 +178,7 @@ export function EssayForm() {
         </label>
         <textarea
           id="topic"
-          className="textarea"
-          style={{ minHeight: 84 }}
+          className="textarea textarea-short"
           placeholder="例如：Suppose you are a student who wants to join a volunteer program. Write a letter to the program organizer to apply for it. You should write at least 120 words."
           value={topic}
           onChange={(e) => setTopic(e.target.value)}
@@ -196,8 +210,7 @@ export function EssayForm() {
         </label>
         <select
           id="target"
-          className="select"
-          style={{ maxWidth: 320 }}
+          className="select field-narrow"
           value={targetBandLevel}
           onChange={(e) => setTargetBandLevel(e.target.value)}
           disabled={pending}
@@ -214,8 +227,8 @@ export function EssayForm() {
         </select>
       </div>
 
-      <div className="sample-row" style={{ marginBottom: 18 }}>
-        <span className="small muted" style={{ alignSelf: "center" }}>
+      <div className="sample-row">
+        <span className="small muted sample-label">
           没有现成作文？试试：
         </span>
         {SAMPLE_ESSAYS.map((s) => (
@@ -229,7 +242,7 @@ export function EssayForm() {
             }}
           >
             {s.label}
-            <span className="muted" style={{ fontWeight: 400 }}>
+            <span className="muted sample-hint">
               {s.hint}
             </span>
           </button>
@@ -240,16 +253,10 @@ export function EssayForm() {
         <button
           type="submit"
           className="btn btn-primary btn-lg"
-          disabled={pending || tooShort || tooLong || !essay.trim()}
+          disabled={pending || tooShort || !essay.trim()}
         >
           开始批改
         </button>
-
-        {tooLong && (
-          <span className="counter counter-warn">
-            超过 {MAX_ESSAY_CHARS} 字符上限，请删减后再提交
-          </span>
-        )}
 
         <span className={`counter${essay && (wordCount < TARGET_MIN || wordCount > TARGET_MAX) ? " counter-warn" : ""}`}>
           {wordCount} 词
@@ -270,7 +277,7 @@ export function EssayForm() {
           </button>
         )}
 
-        <span className="muted small" style={{ marginLeft: "auto" }}>
+        <span className="muted small form-note">
           通常 10 秒左右，长作文会更久
         </span>
       </div>

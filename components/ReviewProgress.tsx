@@ -85,44 +85,44 @@ export function ReviewProgress({
     <>
       <div className="card">
         <div className="row-between">
-          <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <div className="progress-title">
             {running && <span className="spinner" />}
-            <strong style={{ fontSize: 16 }}>{title}</strong>
+            <strong>{title}</strong>
           </div>
           <span className="elapsed">已用 {elapsed} 秒</span>
         </div>
 
-        <p className="muted small" style={{ marginTop: 12, marginBottom: 0 }}>
+        <p className="muted small progress-sub">
           {progress?.model ? `模型：${progress.model}。` : ""}
           报告正一边生成一边填到下面，完成后会自动跳到完整结果页。
           {chars > 0 && ` 已收到 ${chars} 字符。`}
         </p>
 
         {error && (
-          <div className="alert alert-error" style={{ marginTop: 16, marginBottom: 0 }}>
+          <div className="alert alert-error alert-inline">
             <strong>本次批改没有跑完</strong>
             {error.message}
-            <div style={{ marginTop: 6 }}>
+            <div className="alert-detail">
               下面是已经生成好的部分，<b>不完整、也没有分数</b>，不能当报告看。
             </div>
           </div>
         )}
 
         {stalled && (
-          <div className="alert alert-warn" style={{ marginTop: 16, marginBottom: 0 }}>
+          <div className="alert alert-warn alert-inline">
             <strong>上游有一会儿没动静了</strong>
             已经 {stalledSeconds} 秒没有新的内容。可能是模型在长思考，也可能是网络在抖。
             服务端会在长时间无响应后主动放弃并报错。
           </div>
         )}
 
-        <div className="row-between" style={{ marginTop: 18 }}>
+        <div className="row-between progress-actions">
           {running ? (
             <button type="button" className="btn" onClick={onCancel}>
               取消批改
             </button>
           ) : (
-            <div style={{ display: "flex", gap: 10 }}>
+            <div className="btn-row">
               {onRetry && (
                 <button type="button" className="btn btn-primary" onClick={onRetry}>
                   重新批改
@@ -194,9 +194,7 @@ export function ReviewProgress({
 
       <h2 className="section-title">
         证据溯源
-        <span className="muted small" style={{ fontWeight: 400, marginLeft: 10 }}>
-          每条判断都对应原文的具体位置
-        </span>
+        <span className="section-sub">每条判断都对应原文的具体位置</span>
       </h2>
       {progress && progress.evidence.length > 0 ? (
         <EvidenceList evidence={progress.evidence} />

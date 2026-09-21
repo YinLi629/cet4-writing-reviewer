@@ -1,0 +1,17 @@
+# 绝不能被上传到 Vercel 的东西。
+#
+# ⚠️ `.env.local` 里有**真的** DeepSeek API key 和**真的**访问口令。
+# `.gitignore` 里的 `.env*.local` 只管 git，不保证上传逻辑也照它办——
+# 所以这里再明说一次。往 Vercel 传变量请走 `vercel env add`（或者后台），
+# 不要指望这个文件被上传。
+.env.local
+.env*.local
+.env.local.example
+.env
+
+# 本机构建产物：Vercel 自己会构建，传上去只是浪费
+.next/
+.selftest-build/
+.db-build/
+.eval-build/
+tsconfig.tsbuildinfo

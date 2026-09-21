@@ -12,6 +12,9 @@ dist/
 next-env.d.ts
 .selftest-build/
 
+# 建表和冒烟测试脚本的编译输出（db:init / db:smoke）
+.db-build/
+
 # 批改质量评测的中间产物：编译输出和跑出来的原始结果（含学生作文，不提交）
 .eval-build/
 .eval-out/

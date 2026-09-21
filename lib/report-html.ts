@@ -99,78 +99,113 @@ function upgradeCard(a: ReviewResult["upgradePlan"][number], index: number): str
 
 const REPORT_CSS = `
   :root {
-    --ink: #1a1a1a; --muted: #6b6b6b; --line: #e3e3e3; --bg: #fafaf8;
-    --card: #ffffff; --accent: #1f6feb;
-    --strength: #1a7f4b; --strength-bg: #e8f5ee;
-    --minor: #b06a00; --minor-bg: #fdf3e2;
-    --major: #c0392b; --major-bg: #fdecea;
+    /*
+     * 令牌值和 app/globals.css 的浅色一套对齐——报告是网页的另一种渲染，
+     * 不是另一套设计。网页换配色时这里要跟着换，否则下载下来会比网页旧一个版本。
+     *
+     * 报告**只有浅色**：它会被打印、会被发出去、会脱离浏览器设置单独存在，
+     * 跟着开关变深色只会在纸上变成一片黑。color-scheme 也写死 light，
+     * 否则深色系统的浏览器会把滚动条和表单控件画成深色，贴在奶油底上很脏。
+     */
+    color-scheme: light;
+
+    --ink: #2c2436; --ink-2: #55495f; --muted: #6f6478;
+    --line: #ebe2d9;
+    --bg: #faf7f4; --card: #ffffff; --surface-2: #f3ede6;
+    --accent: #5fd8c4; --accent-ink: #0c4a45;
+    /* 薄荷绿是浅底深字用的底色，不能拿来当文字色：奶油底上读不清 */
+    --link: #0f766e;
+    --strength: #15803d; --strength-bg: #e9f7ef;
+    --minor: #a16207; --minor-bg: #fdf4e3; --minor-line: #e8c98a;
+    --major: #b91c1c; --major-bg: #fdeceb;
+    --radius: 16px; --radius-sm: 10px; --radius-pill: 999px;
+    --shadow: 0 1px 2px rgba(58, 42, 32, .05), 0 4px 12px rgba(58, 42, 32, .06);
+    --serif: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 40px 20px; background: var(--bg); color: var(--ink);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+                 "PingFang SC", "Hiragino Sans GB", sans-serif;
     line-height: 1.7;
   }
   .wrap { max-width: 860px; margin: 0 auto; }
   h1 { font-size: 24px; margin: 0 0 4px; }
-  h2 { font-size: 17px; margin: 36px 0 12px; padding-bottom: 8px; border-bottom: 2px solid var(--line); }
+  h2 {
+    font-size: 17px; margin: 36px 0 12px; padding-bottom: 8px;
+    /* 一条发丝线，开头一段是薄荷——和网页上的 .section-title 同一个做法 */
+    background-image: linear-gradient(90deg, var(--accent), var(--line) 140px, var(--line));
+    background-repeat: no-repeat; background-position: 0 100%; background-size: 100% 2px;
+  }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; margin-bottom: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+          padding: 16px 18px; margin-bottom: 12px; box-shadow: var(--shadow); }
 
   .scoreboard { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  .score-main { flex: 1 1 240px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 20px; }
+  .score-main { flex: 1 1 240px; background: var(--card); border: 1px solid var(--line);
+                border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
   .score-big { font-size: 42px; font-weight: 700; line-height: 1; }
   .score-big small { font-size: 16px; font-weight: 400; color: var(--muted); }
   .score-106 { color: var(--muted); font-size: 14px; margin-top: 6px; }
-  .band-pill { display: inline-block; margin-top: 12px; padding: 4px 12px; border-radius: 999px;
-               background: var(--accent); color: #fff; font-size: 14px; font-weight: 600; }
-  .band-desc { flex: 1 1 300px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 20px; font-size: 14px; }
+  .band-pill { display: inline-block; margin-top: 12px; padding: 4px 12px; border-radius: var(--radius-pill);
+               background: var(--accent); color: var(--accent-ink); font-size: 14px; font-weight: 600; }
+  .band-desc { flex: 1 1 300px; background: var(--card); border: 1px solid var(--line);
+               border-radius: var(--radius); padding: 20px; font-size: 14px; box-shadow: var(--shadow); }
   .band-desc .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
 
   .stats { display: flex; gap: 24px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 12px; }
   .stats b { color: var(--ink); }
 
-  .warn { background: var(--minor-bg); border: 1px solid #f0d9b0; border-radius: 8px; padding: 14px 18px; margin-bottom: 12px; font-size: 14px; }
+  .warn { background: var(--minor-bg); border: 1px solid var(--minor-line); border-radius: var(--radius);
+          padding: 14px 18px; margin-bottom: 12px; font-size: 14px; }
   .warn ul { margin: 8px 0 0; padding-left: 20px; }
 
   .dims { display: flex; gap: 12px; flex-wrap: wrap; }
-  .dim-card { flex: 1 1 220px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .dim-card { flex: 1 1 220px; background: var(--card); border: 1px solid var(--line);
+              border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }
   .dim-name { font-weight: 600; margin-bottom: 8px; }
-  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
-  .meter i { display: block; height: 100%; background: var(--accent); }
-  .dim-comment { font-size: 13px; color: #444; margin: 0; }
+  .meter { height: 8px; background: var(--line); border-radius: var(--radius-pill); overflow: hidden; margin-bottom: 10px; }
+  /*
+   * 从 0 长到行内 width 指定的终点。在浏览器里打开报告时条会生长，
+   * 打印时关掉（见下）——不然打印预览可能抓到动画的第一帧，一条空槽。
+   */
+  @keyframes grow { from { width: 0; } }
+  .meter i { display: block; height: 100%; background: var(--accent);
+             animation: grow .7s cubic-bezier(.16, 1, .3, 1) both; }
+  .dim-comment { font-size: 13px; color: var(--ink-2); margin: 0; }
   .dim-note { font-size: 12px; color: var(--muted); margin: 10px 0 0; font-style: italic; }
 
-  .essay { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 20px;
-           white-space: pre-wrap; font-size: 15px; line-height: 2; }
-  mark.ev { padding: 2px 1px; border-radius: 3px; cursor: help; }
+  .essay { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px;
+           white-space: pre-wrap; font-size: 15px; line-height: 2; box-shadow: var(--shadow); }
+  mark.ev { padding: 2px 1px; border-radius: 4px; cursor: help; }
   mark.ev-strength { background: var(--strength-bg); border-bottom: 2px solid var(--strength); }
   mark.ev-minor { background: var(--minor-bg); border-bottom: 2px solid var(--minor); }
   mark.ev-major { background: var(--major-bg); border-bottom: 2px solid var(--major); }
 
   .ev-head, .up-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-  .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+  .badge { font-size: 12px; padding: 2px 9px; border-radius: var(--radius-pill); font-weight: 600; }
   .badge-strength { background: var(--strength-bg); color: var(--strength); }
   .badge-minor { background: var(--minor-bg); color: var(--minor); }
   .badge-major { background: var(--major-bg); color: var(--major); }
-  .dim { font-size: 12px; color: var(--muted); border: 1px solid var(--line); padding: 2px 8px; border-radius: 999px; }
+  .dim { font-size: 12px; color: var(--muted); border: 1px solid var(--line); padding: 2px 8px; border-radius: var(--radius-pill); }
   .loc { font-size: 12px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
   .loc-bad { color: var(--major); }
   .ev-card { border-left: 3px solid var(--line); }
   .ev-card-strength { border-left-color: var(--strength); }
   .ev-card-minor { border-left-color: var(--minor); }
   .ev-card-major { border-left-color: var(--major); }
-  blockquote { margin: 0 0 10px; padding: 8px 14px; background: var(--bg); border-radius: 6px;
-               font-family: Georgia, "Times New Roman", serif; font-size: 14px; color: #333; }
+  blockquote { margin: 0 0 10px; padding: 8px 14px; background: var(--surface-2); border-radius: var(--radius-sm);
+               font-family: var(--serif); font-size: 14px; color: var(--ink); }
   .ev-comment { margin: 0 0 6px; font-size: 14px; }
-  .ev-suggestion { margin: 0; font-size: 13px; color: #444; }
-  .pri { font-size: 12px; font-weight: 700; color: #fff; background: var(--accent); padding: 2px 10px; border-radius: 999px; }
+  .ev-suggestion { margin: 0; font-size: 13px; color: var(--ink-2); }
+  .pri { font-size: 12px; font-weight: 700; color: var(--accent-ink); background: var(--accent);
+         padding: 2px 10px; border-radius: var(--radius-pill); }
   .chips { margin-left: auto; font-size: 12px; color: var(--muted); }
-  .chip { display: inline-block; margin-left: 4px; padding: 1px 7px; border-radius: 4px;
-          background: var(--bg); border: 1px solid var(--line); color: var(--accent); text-decoration: none; font-variant-numeric: tabular-nums; }
+  .chip { display: inline-block; margin-left: 4px; padding: 1px 7px; border-radius: var(--radius-sm);
+          background: var(--bg); border: 1px solid var(--line); color: var(--link); text-decoration: none; font-variant-numeric: tabular-nums; }
   .up-action { font-weight: 600; margin: 0 0 6px; font-size: 15px; }
-  .up-rationale { margin: 0; font-size: 13px; color: #555; }
-  .ex { margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .up-rationale { margin: 0; font-size: 13px; color: var(--ink-2); }
+  .ex { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
   .ex-row { display: flex; gap: 10px; padding: 9px 12px; font-size: 14px; align-items: flex-start; }
   .ex-row + .ex-row { border-top: 1px solid var(--line); }
   .ex-tag { flex: 0 0 auto; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 4px; }
@@ -181,9 +216,15 @@ const REPORT_CSS = `
            color: var(--muted); font-size: 12px; line-height: 1.9; }
   ul.plain { padding-left: 20px; margin: 0; font-size: 14px; }
 
+  @media (prefers-reduced-motion: reduce) {
+    .meter i { animation: none; }
+  }
+
   @media print {
     body { background: #fff; padding: 0; }
-    .card, .score-main, .band-desc, .dim-card, .essay { break-inside: avoid; }
+    .card, .score-main, .band-desc, .dim-card, .essay { break-inside: avoid; box-shadow: none; }
+    /* 纸上没有动画。不关掉的话，打印预览可能抓到 grow 的第一帧——一条空槽 */
+    .meter i { animation: none; }
     .chip { color: var(--ink); }
   }
 `;

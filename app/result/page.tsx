@@ -43,7 +43,7 @@ export default function ResultPage() {
             <br />
             重新提交一篇作文即可。
           </p>
-          <Link href="/" className="btn btn-primary" style={{ marginTop: 16 }}>
+          <Link href="/review" className="btn btn-primary">
             去批改作文
           </Link>
         </div>
@@ -53,7 +53,7 @@ export default function ResultPage() {
 
   return (
     <div className="container">
-      <div className="hero" style={{ paddingBottom: 14 }}>
+      <div className="hero hero-compact">
         <h1>批改报告</h1>
         {result.meta.topic && (
           <p className="small">

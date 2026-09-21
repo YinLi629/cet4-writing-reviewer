@@ -18,7 +18,9 @@ export function BandCard({ result }: { result: ReviewResult }) {
     <>
       <div className="scoreboard">
         <div className="score-main">
-          <div className="score-big">
+          {/* score-settled 是一次性的落定（缩放+淡入），不是数字滚动：
+              滚动会短暂显示 0→4→9 这些不是终值的中间数，这个 app 不做那种事 */}
+          <div className="score-big score-settled">
             {score15}
             <small> / 15</small>
           </div>

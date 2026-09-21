@@ -29,12 +29,13 @@ export function ResultActions({ result }: { result: ReviewResult }) {
 
   const handleNew = () => {
     clearResult();
-    router.push("/");
+    // 回批改页，不是首页：首页是那个开播页，从这里跳回去等于把人赶出流程
+    router.push("/review");
   };
 
   return (
-    <div className="row-between" style={{ marginBottom: 18 }}>
-      <div style={{ display: "flex", gap: 9, flexWrap: "wrap" }}>
+    <div className="row-between result-actions">
+      <div className="btn-row">
         <button type="button" className="btn btn-primary" onClick={handleDownload} disabled={busy}>
           下载 HTML 批改报告
         </button>

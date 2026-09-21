@@ -11,7 +11,37 @@ import { segmentEssay } from "../lib/highlight";
 import { scanJsonPrefix, type ScanResult, type ScannedMember } from "../lib/json-stream";
 import { METHOD_LABEL } from "../lib/labels";
 import { MAX_EVIDENCE } from "../lib/prompt";
-import { clientKeyFrom, configFromEnv, createRateLimiter } from "../lib/rate-limit";
+import {
+  buildFailureUpsert,
+  buildPeek,
+  buildSuccessAndCount,
+  buildSweep,
+} from "../lib/rate-limit-sql";
+import {
+  clientKeyFrom,
+  clearedFailureState,
+  configFromEnv,
+  FAIL_DECAY_SECS,
+  FAIL_TIER1_COUNT,
+  FAIL_TIER1_LOCK_SECS,
+  FAIL_TIER2_COUNT,
+  FAIL_TIER2_LOCK_SECS,
+  HOUR_SECS,
+  isLocked,
+  isNewStreak,
+  isOverLimit,
+  LOCK_STREAK_CAP_SECS,
+  lockSecsFor,
+  nextFailureState,
+  type FailureState,
+  type RateLimitPolicy,
+} from "../lib/rate-limit";
+import {
+  createMemoryStore,
+  persistenceMode,
+  SWEEP_RETENTION_WINDOWS,
+  withFallback,
+} from "../lib/rate-limit-store";
 import { buildReportHtml, escapeHtml, renderHighlightedEssay } from "../lib/report-html";
 import { MAX_BODY_BYTES, readJsonBody } from "../lib/request-body";
 import {
@@ -30,7 +60,6 @@ import { __internals, normalizeInput, reviewEssay, reviewEssayStream } from "../
 import { createSseFrameParser, encodeSseFrame, SSE_RESPONSE_HEADERS } from "../lib/sse";
 import { computeStats } from "../lib/text-stats";
 import {
-  MAX_ESSAY_CHARS,
   MAX_QUOTE_CHARS,
   MAX_TOPIC_CHARS,
   type ReviewResult,
@@ -56,6 +85,23 @@ function eq(name: string, actual: unknown, expected: unknown) {
     actual,
     expected,
   });
+}
+
+/**
+ * 去掉 SQL 里的 `--` 注释。
+ *
+ * 下面那些断言扫的是 SQL 文本，而文本里带着写给读者看的注释——注释里会提到
+ * `$3 = 10` 这类东西，甚至可能被写得更像代码。断言应该只看**真正会执行的部分**，
+ * 否则改一句注释就能让测试变红（或者更糟：让本该变红的测试保持绿）。
+ */
+function stripSqlComments(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const at = line.indexOf("--");
+      return at === -1 ? line : line.slice(0, at);
+    })
+    .join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +305,10 @@ const bad = (essay: unknown) => {
 };
 check("空作文被拒", bad("") !== null);
 check("过短作文被拒", bad("too short") !== null);
-check("超长作文被拒", bad("a".repeat(MAX_ESSAY_CHARS + 1)) !== null);
+// 作文没有字数上限（2026-09 取消的）。原来这里断言的是一条 8000 字符的上限，
+// 现在反过来钉住"不再有上限"。真正拦住超长输入的是 request-body.ts 的 128 KB
+// 请求体上限，那一步在 JSON.parse 之前就返回 413，走不到 normalizeInput。
+check("超长作文不再被拒", bad("a".repeat(20000)) === null);
 check("正常作文通过", bad("This is a long enough essay to be graded properly.") === null);
 
 // 题目也要有上限：它会原样进 prompt，不限的话 token 成本成倍放大，
@@ -604,100 +653,470 @@ async function runBodyLimitTests() {
 }
 
 // ---------------------------------------------------------------------------
-function runRateLimitTests() {
+async function runRateLimitTests(): Promise<void> {
   console.log("\n[11] 限流与口令锁定");
 
   // 冻结的时间轴，避免测试受真实时钟影响
   const T0 = 1_000_000;
-  const cfg = {
+  const policy: RateLimitPolicy = {
     reviewLimit: 3,
-    reviewWindowMs: 1000,
-    maxFailures: 3,
-    lockoutMs: 5000,
+    reviewWindowSecs: 60,
     failDelayMs: 0,
   };
 
-  const rl = createRateLimiter(cfg);
-  check("未超限：第 1 次放行", rl.checkReview("a", T0).allowed);
-  check("未超限：第 2 次放行", rl.checkReview("a", T0 + 1).allowed);
-  check("未超限：第 3 次放行", rl.checkReview("a", T0 + 2).allowed);
+  // ---- 常量不变式 ---------------------------------------------------------
+  // 这几条是"配置之间互相矛盾"那一整类问题的守门人。规则本身写在代码里、
+  // 不做成环境变量，但常量之间仍然可以互相踩：改一个数就可能破坏另一个前提。
 
-  const denied = rl.checkReview("a", T0 + 3);
-  check("超出上限：第 4 次被拒", !denied.allowed);
   check(
-    "被拒时给出剩余等待时长",
-    denied.retryAfterMs > 0 && denied.retryAfterMs <= cfg.reviewWindowMs,
-    denied,
+    "档位递增：10 次的锁必须比 7 次的锁长",
+    FAIL_TIER2_COUNT > FAIL_TIER1_COUNT && FAIL_TIER2_LOCK_SECS > FAIL_TIER1_LOCK_SECS,
+  );
+  // 衰减窗口比封顶还短的话，攻击者等够衰减时间再失败一次，就能把一把活着的锁
+  // 顺手清掉（isNewStreak 里的"锁定期内不衰减"挡的是另一条路，别指望它兜住这条）
+  check(
+    "衰减窗口比锁的总时长封顶长（否则锁会被自己过期掉）",
+    FAIL_DECAY_SECS > LOCK_STREAK_CAP_SECS,
+  );
+  // 清理比封顶更早动到一行的话，会把一把活着的锁连行删掉：攻击者发现自己突然
+  // 又能猜了，失败计数和封顶的起算点也一起归零
+  check(
+    "陈旧行保留期比锁的总时长封顶长（否则清理会删掉活着的锁）",
+    SWEEP_RETENTION_WINDOWS * HOUR_SECS > LOCK_STREAK_CAP_SECS,
+  );
+  check("封顶比最高一档的锁长（否则封顶让锁永远夹不满）", LOCK_STREAK_CAP_SECS > FAIL_TIER2_LOCK_SECS);
+
+  // ---- 档位选择 -----------------------------------------------------------
+  const tiers: Array<[number, number]> = [
+    [0, 0],
+    [1, 0],
+    [FAIL_TIER1_COUNT - 1, 0],
+    [FAIL_TIER1_COUNT, FAIL_TIER1_LOCK_SECS],
+    [FAIL_TIER1_COUNT + 1, FAIL_TIER1_LOCK_SECS],
+    [FAIL_TIER2_COUNT - 1, FAIL_TIER1_LOCK_SECS],
+    [FAIL_TIER2_COUNT, FAIL_TIER2_LOCK_SECS],
+    [FAIL_TIER2_COUNT + 1, FAIL_TIER2_LOCK_SECS],
+    [500, FAIL_TIER2_LOCK_SECS],
+  ];
+  for (const [failCount, expected] of tiers) {
+    eq(`档位：第 ${failCount} 次失败锁 ${expected} 秒`, lockSecsFor(failCount), expected);
+  }
+
+  // ---- 连续失败的时间线 ---------------------------------------------------
+  // 一次都不换时间：模拟"攻击者连着打"。锁的续期和封顶都在这一段里。
+  let state: FailureState = clearedFailureState();
+  for (let i = 1; i < FAIL_TIER1_COUNT; i++) {
+    state = nextFailureState(state, T0);
+  }
+  check(
+    `前 ${FAIL_TIER1_COUNT - 1} 次失败都不锁`,
+    state.failCount === FAIL_TIER1_COUNT - 1 && state.lockedUntil === null,
+    state,
   );
 
-  check("不同 IP 互不影响", rl.checkReview("b", T0 + 3).allowed);
-  // 最老的那次（T0）滑出窗口后，腾出一个名额
-  check("窗口滑过后恢复放行", rl.checkReview("a", T0 + 1001).allowed);
+  state = nextFailureState(state, T0);
+  eq("第 7 次失败：计数到 7", state.failCount, FAIL_TIER1_COUNT);
+  eq("第 7 次失败：锁 60 秒", state.lockedUntil, T0 + FAIL_TIER1_LOCK_SECS * 1000);
+  eq("第 7 次失败：记下这把锁的起算点", state.lockStartedAt, T0);
 
-  // 不限制时永远放行
-  const unlimited = createRateLimiter({ ...cfg, reviewLimit: 0 });
-  for (let i = 0; i < 100; i++) unlimited.checkReview("a", T0 + i);
-  check("reviewLimit = 0 表示不限", unlimited.checkReview("a", T0 + 100).allowed);
+  state = nextFailureState(state, T0);
+  state = nextFailureState(state, T0);
+  eq("第 9 次失败：仍在 1 分钟档", state.lockedUntil, T0 + FAIL_TIER1_LOCK_SECS * 1000);
 
-  // 口令失败锁定
-  const lock = createRateLimiter(cfg);
-  check("初始未锁定", lock.lockState("k", T0).allowed);
-  lock.recordFailure("k", T0);
-  lock.recordFailure("k", T0 + 1);
-  check("未达上限仍可尝试", lock.lockState("k", T0 + 2).allowed);
+  state = nextFailureState(state, T0);
+  eq("第 10 次失败：升到 5 分钟档", state.lockedUntil, T0 + FAIL_TIER2_LOCK_SECS * 1000);
 
-  lock.recordFailure("k", T0 + 2);
-  // 锁定从"第 maxFailures 次失败那一刻"起算，也就是 T0+2
-  const lockUntil = T0 + 2 + cfg.lockoutMs;
-  const locked = lock.lockState("k", T0 + 3);
-  check("达到失败上限：锁定", !locked.allowed);
-  eq("锁定时长正确", locked.retryAfterMs, lockUntil - (T0 + 3));
+  state = nextFailureState(state, T0);
+  state = nextFailureState(state, T0);
+  eq("第 12 次失败：仍是 5 分钟档（不回落到 1 分钟）", state.lockedUntil, T0 + FAIL_TIER2_LOCK_SECS * 1000);
+  eq("起算点始终是第一次上锁那一刻（封顶才有意义）", state.lockStartedAt, T0);
 
-  // 锁定期间继续猜不会把锁续期（否则伪造 IP 的人可以把某个 IP 永久锁死）
-  lock.recordFailure("k", T0 + 100);
+  // ---- 衰减 ---------------------------------------------------------------
+  const stale: FailureState = {
+    failCount: 6,
+    lastFailAt: T0,
+    lockStartedAt: null,
+    lockedUntil: null,
+  };
+  // 边界必须和 SQL 里的 `last_fail_at <= now() - interval` 逐字对齐，
+  // 所以是 >= 而不是 >
+  check("刚好过一个衰减窗口：算新的一串", isNewStreak(stale, T0 + FAIL_DECAY_SECS * 1000));
+  check("差 1 毫秒：仍算旧的一串", !isNewStreak(stale, T0 + FAIL_DECAY_SECS * 1000 - 1));
+  eq("衰减之后从头数（不是接着 7 往上走）", nextFailureState(stale, T0 + FAIL_DECAY_SECS * 1000).failCount, 1);
+
+  // 下面这条守的是 isNewStreak 里的第二个条件："还锁着就不算衰减"。
+  //
+  // ⚠️ 先说清它的可达性，免得读的人以为这里在测一条真实路径。
+  // 因为 FAIL_DECAY_SECS > LOCK_STREAK_CAP_SECS（上面有断言钉着），而锁的起算点
+  // 永远不会晚于最后一次失败（两者都是"失败那一刻"设的），所以
+  // `lockedUntil <= lockStartedAt + CAP <= lastFailAt + CAP < lastFailAt + DECAY`
+  // ——"还锁着"和"已过衰减窗口"在当前常量下**不可能同时成立**，这条守卫够不着。
+  //
+  // 留着它是因为常量不是永远不变的：一旦有人把某一档的锁调到比衰减窗口还长，
+  // 攻击者等够衰减时间再失败一次就能把活锁顺手清掉，而那时不会有别的测试拦下来。
+  // 所以这里用一个**现实中构造不出来**的状态（锁的起算点晚于最后一次失败）
+  // 把守卫本身钉住。删掉守卫这条就会红。
+  const syntheticLock: FailureState = {
+    failCount: 9,
+    lastFailAt: T0,
+    lockStartedAt: T0 + FAIL_DECAY_SECS * 1000,
+    lockedUntil: T0 + FAIL_DECAY_SECS * 1000 + 60_000,
+  };
+  check(
+    "还锁着的时候，衰减窗口过了也不算新的一串",
+    !isNewStreak(syntheticLock, T0 + FAIL_DECAY_SECS * 1000),
+  );
+
+  // ---- 总时长封顶 ---------------------------------------------------------
+  const capped: FailureState = {
+    failCount: 11,
+    lastFailAt: T0,
+    lockStartedAt: T0,
+    lockedUntil: T0 + 999_999,
+  };
+  const afterCap = nextFailureState(capped, T0 + LOCK_STREAK_CAP_SECS * 1000);
+  eq("封顶用满：自动解锁并清零，重新给满次数", afterCap.failCount, 1);
+  eq("封顶用满：不再是锁定状态", afterCap.lockedUntil, null);
+
+  // LEAST() 那一半：剩下的封顶时间比这一档的锁还短时要夹短
+  const nearCap: FailureState = {
+    failCount: 9,
+    lastFailAt: T0,
+    lockStartedAt: T0 - (LOCK_STREAK_CAP_SECS * 1000 - 20_000),
+    lockedUntil: null,
+  };
   eq(
-    "锁定期间继续失败不会延长锁定",
-    lock.lockState("k", T0 + 101).retryAfterMs,
-    lockUntil - (T0 + 101),
+    "新锁被剩下的封顶时间夹短（20 秒，而不是整档 5 分钟）",
+    nextFailureState(nearCap, T0).lockedUntil,
+    T0 + 20_000,
   );
-  check("锁定到期后恢复", lock.lockState("k", T0 + 5003).allowed);
 
-  // 成功一次就清空失败计数
-  lock.recordFailure("k", T0 + 6000);
-  lock.recordFailure("k", T0 + 6001);
-  lock.recordSuccess("k");
-  lock.recordFailure("k", T0 + 6002);
-  lock.recordFailure("k", T0 + 6003);
-  check("成功后失败计数清零（重新数满才锁）", lock.lockState("k", T0 + 6004).allowed);
+  check("isLocked 的边界：到期那一刻就不算锁着了", !isLocked({ ...clearedFailureState(), lockedUntil: T0 }, T0));
 
-  // 不同 key 的锁定互不影响
-  check("锁定是按 key 隔离的", lock.lockState("other", T0 + 6004).allowed);
+  // ---- 额度判定 -----------------------------------------------------------
+  check("额度 100：第 100 次仍放行", !isOverLimit(100, 100));
+  check("额度 100：第 101 次被拒", isOverLimit(100, 101));
+  check("额度 0 表示不限（不能拧成一律拒绝）", !isOverLimit(0, 999_999));
+  check("负额度也表示不限", !isOverLimit(-5, 999_999));
 
-  // Map 必须有机会性清理，否则换 IP 灌请求会把内存撑爆——
-  // 那就成了"限流器自己变成漏洞"
-  const sweeper = createRateLimiter({ ...cfg, reviewLimit: 5, reviewWindowMs: 1000 });
-  for (let i = 0; i < 500; i++) sweeper.checkReview(`ip-${i}`, T0);
-  for (let i = 0; i < 300; i++) sweeper.checkReview(`later-${i}`, T0 + 10_000);
+  // ---- SQL 文本 -----------------------------------------------------------
+  // 这些性质**只存在于文本里**：内存假实现证明不了 CASE 分支、档位顺序、
+  // 两个关注点有没有越界改对方的列。真正打到数据库的验证在 scripts/db/smoke.ts。
+
+  const FAIL_KEY = "1.2.3.4";
+  const failSql = buildFailureUpsert(FAIL_KEY);
+  const failText = stripSqlComments(failSql.text);
+
+  eq("失败语句：参数顺序与取值", failSql.params, [
+    FAIL_KEY,
+    FAIL_DECAY_SECS,
+    FAIL_TIER2_COUNT,
+    FAIL_TIER2_LOCK_SECS,
+    FAIL_TIER1_COUNT,
+    FAIL_TIER1_LOCK_SECS,
+    LOCK_STREAK_CAP_SECS,
+  ]);
+  check("失败语句：是一条原子 upsert，不是读-改-写", /ON CONFLICT \(client_key\) DO UPDATE/.test(failText));
+  check("失败语句：RETURNING 带回新计数和剩余锁时长", /RETURNING[\s\S]*fail_count/.test(failText) && /retry_after_secs/.test(failText));
+  check("失败语句：返回的是秒数，不是 timestamptz（否则路由又要拿本地时钟去减）", /EXTRACT\(EPOCH/.test(failText) && !/timestamptz/.test(failText));
+  // 调换这两个分支的顺序会让 >= 10 的计数落进 1 分钟档，而且是静默的。
+  // 断言只在 locked_until 那个 CASE 里找位置：$5 在别处也该出现（起算点那一支
+  // 用的就是它），拿整段文本的 indexOf 比大小会被那一处干扰。
+  const lockedUntilBranch = failText.slice(
+    failText.indexOf("locked_until = CASE"),
+    failText.indexOf("ELSE r.locked_until"),
+  );
   check(
-    "过期记录被清理（不会无限增长，一共进过 800 个 key）",
-    sweeper.size() < 400,
-    sweeper.size(),
+    "失败语句：locked_until 里 5 分钟档的分支排在 1 分钟档之前（顺序是不变式）",
+    lockedUntilBranch.includes("$3::int") &&
+      lockedUntilBranch.includes("$5::int") &&
+      lockedUntilBranch.indexOf("$3::int") < lockedUntilBranch.indexOf("$5::int"),
+    lockedUntilBranch,
+  );
+  // 封顶的起算点必须在**第一次上锁**（第 7 次）时就记下。写成只有高档才记
+  // （用 $3 = 10）的话，第 7~9 次失败期间它一直是 NULL，封顶被推迟到第 10 次
+  // 才开始算——攻击者白拿几分钟。这个 bug 真的出现过一次，而且
+  // RETURNING 里没有这一列，所以只有读原始行（db:smoke）或这条文本断言能发现它。
+  const startedBranch = failText.slice(
+    failText.indexOf("lock_started_at = CASE"),
+    failText.indexOf("locked_until = CASE"),
+  );
+  check(
+    "失败语句：封顶的起算点用低档阈值（$5 = 7），不是高档（$3 = 10）",
+    startedBranch.length > 0 &&
+      startedBranch.includes("$5::int") &&
+      !startedBranch.includes("$3::int"),
+    startedBranch,
   );
 
-  // 环境变量：非法值回落到默认值，否则一个手滑的配置就能让站点拒绝所有请求
-  const savedLimit = process.env.REVIEW_RATE_LIMIT_PER_HOUR;
-  const savedAttempts = process.env.ACCESS_CODE_MAX_ATTEMPTS;
-  process.env.REVIEW_RATE_LIMIT_PER_HOUR = "not-a-number";
-  eq("非法环境变量回落默认值", configFromEnv().reviewLimit, 15);
-  process.env.REVIEW_RATE_LIMIT_PER_HOUR = "42";
-  eq("合法环境变量生效", configFromEnv().reviewLimit, 42);
-  process.env.ACCESS_CODE_MAX_ATTEMPTS = "-1";
-  eq("负数环境变量回落默认值", configFromEnv().maxFailures, 5);
-  if (savedLimit === undefined) delete process.env.REVIEW_RATE_LIMIT_PER_HOUR;
-  else process.env.REVIEW_RATE_LIMIT_PER_HOUR = savedLimit;
-  if (savedAttempts === undefined) delete process.env.ACCESS_CODE_MAX_ATTEMPTS;
-  else process.env.ACCESS_CODE_MAX_ATTEMPTS = savedAttempts;
+  // 关注点分离靠"SET 子句里没写那些列"实现，是易碎品
+  check(
+    "失败语句不触碰窗口列（两个关注点共用一个行锁但各管各的）",
+    !/window_(count|start)\s*=/.test(failText),
+  );
+  check("失败语句里没有拼进调用方数据（全走占位符）", !failText.includes(FAIL_KEY));
 
+  const okSql = buildSuccessAndCount(FAIL_KEY, policy.reviewWindowSecs);
+  const okText = stripSqlComments(okSql.text);
+  eq("成功语句：参数", okSql.params, [FAIL_KEY, policy.reviewWindowSecs]);
+  check(
+    "成功语句：把失败记录整个清零",
+    /fail_count = 0/.test(okText) &&
+      /last_fail_at = NULL/.test(okText) &&
+      /lock_started_at = NULL/.test(okText) &&
+      /locked_until = NULL/.test(okText),
+    okText.slice(0, 200),
+  );
+  check("成功语句：同一条语句里自增窗口", /window_count = CASE WHEN/.test(okText));
+  check(
+    "成功语句：RETURNING 带回窗口计数（权威判定用它，不用前置 SELECT 的旧值）",
+    /RETURNING[\s\S]*window_count/.test(okText) && /reset_after_secs/.test(okText),
+  );
+  check("成功语句里没有拼进调用方数据", !okText.includes(FAIL_KEY));
+
+  // 窗口翻滚的条件在两个语句里必须是**同一份文本**——各抄一份取反形式的话，
+  // 两边只在边界上分得开：窗口刚翻过去的那一瞬间，peek 会拿旧窗口的计数
+  // 把新窗口的第一个请求误杀，而受害者只是"上一分钟刚好用满过"的那小部分人。
+  const expiryExpr = /r\.window_start <= now\(\) - make_interval\(secs => \$2::double precision\)/g;
+  const expiries = (text: string) => text.match(expiryExpr) ?? [];
+  eq("成功语句：窗口过期的判定用了两次（count 和 start 各一次）", expiries(okText).length, 2);
+
+  const peekSql = buildPeek(FAIL_KEY, policy.reviewWindowSecs);
+  const peekText = stripSqlComments(peekSql.text);
+  const peekExpiries = expiries(peekText);
+  const okExpiries = expiries(okText);
+
+  eq("早拒语句：窗口过期的判定用了两次", peekExpiries.length, 2);
+  check(
+    "早拒语句和成功语句用的是逐字相同的窗口过期表达式",
+    peekExpiries.length > 0 && okExpiries.length > 0 && peekText.includes(okExpiries[0]!),
+    { peek: peekExpiries[0], ok: okExpiries[0] },
+  );
+
+  eq("早拒语句：参数", peekSql.params, [FAIL_KEY, policy.reviewWindowSecs]);
+  check("早拒语句：只读不写", /^\s*SELECT/.test(peekText) && !/UPDATE|INSERT|DELETE/.test(peekText));
+  check("早拒语句：不碰失败计数（它只是建议性的，不负责计数）", !/fail_count/.test(peekText));
+  check("早拒语句里没有拼进调用方数据", !peekText.includes(FAIL_KEY));
+
+  const sweepSql = buildSweep(policy.reviewWindowSecs * SWEEP_RETENTION_WINDOWS);
+  const sweepText = stripSqlComments(sweepSql.text);
+  eq("清理语句：参数是保留秒数", sweepSql.params, [policy.reviewWindowSecs * SWEEP_RETENTION_WINDOWS]);
+  check("清理语句：按 updated_at 删，且是 DELETE", /DELETE FROM rate_limits/.test(sweepText) && /updated_at </.test(sweepText));
+
+  // ---- 内存 store ---------------------------------------------------------
+  // ⚠️ 显式注入内存实现，绝不从环境变量"嗅探"用不用数据库。
+  // 否则任何 shell 里配了 DATABASE_URL 的人跑 npm run selftest 都会开始打真实数据库。
+  let clock = T0;
+  const mem = createMemoryStore(policy, () => clock);
+
+  const first = await mem.recordSuccess("a");
+  eq("内存版：第 1 次请求计到 1", first.windowCount, 1);
+  await mem.recordSuccess("a");
+  const third = await mem.recordSuccess("a");
+  eq("内存版：第 3 次请求计到 3（额度正好用满）", third.windowCount, 3);
+  check(
+    "内存版：额度 3 时计数 3 还没超（必须用 > 而不是 >=）",
+    !isOverLimit(policy.reviewLimit, third.windowCount),
+  );
+
+  const fourth = await mem.recordSuccess("a");
+  check("内存版：第 4 次超限", isOverLimit(policy.reviewLimit, fourth.windowCount));
+
+  const peeked = await mem.peek("a");
+  eq("内存版：peek 把早拒要的两个数都带回来", [peeked.lockRetryAfterMs, peeked.windowCount], [0, 4]);
+  check("内存版：peek 给出窗口剩余时间", peeked.windowResetAfterMs === policy.reviewWindowSecs * 1000, peeked);
+
+  check("内存版：不同 key 的额度互不影响", (await mem.peek("b")).windowCount === 0);
+
+  clock = T0 + policy.reviewWindowSecs * 1000 + 1;
+  eq("内存版：窗口过后续上，不是接着 4 往上走", (await mem.recordSuccess("a")).windowCount, 1);
+
+  // peek 必须自己按窗口翻滚修正。报了旧窗口的计数，就会把新窗口的第一个请求误杀——
+  // 而且只在"上一分钟刚好用满过"的人身上出现，最难复现的那类 bug
+  clock = T0;
+  const memWindow = createMemoryStore(policy, () => clock);
+  await memWindow.recordSuccess("w");
+  await memWindow.recordSuccess("w");
+  eq("内存版：窗口过期前 peek 报 2", (await memWindow.peek("w")).windowCount, 2);
+  clock = T0 + policy.reviewWindowSecs * 1000 + 1;
+  eq(
+    "内存版：窗口过期后 peek 报 0（不能拿旧窗口的计数误杀新窗口）",
+    (await memWindow.peek("w")).windowCount,
+    0,
+  );
+  eq("内存版：过期窗口的剩余时间报 0，不能是负数", (await memWindow.peek("w")).windowResetAfterMs, 0);
+
+  // 失败不占额度，两道限制各管各的
+  clock = T0;
+  const mem2 = createMemoryStore(policy, () => clock);
+  await mem2.recordSuccess("c");
+  await mem2.recordSuccess("c");
+  await mem2.recordFailure("c");
+  await mem2.recordFailure("c");
+  eq("内存版：失败**不**占用批改额度", (await mem2.peek("c")).windowCount, 2);
+  eq("内存版：失败照常计数", (await mem2.recordFailure("c")).failCount, 3);
+
+  // 口令正确要把失败记录整个清掉（包括那把锁）
+  clock = T0;
+  const mem3 = createMemoryStore(policy, () => clock);
+  for (let i = 0; i < FAIL_TIER2_COUNT + 1; i++) await mem3.recordFailure("d");
+  check("内存版：连错够次数就锁上", (await mem3.peek("d")).lockRetryAfterMs > 0);
+  await mem3.recordSuccess("d");
+  eq("内存版：口令正确后锁和失败计数一起清零", (await mem3.peek("d")).lockRetryAfterMs, 0);
+  eq("内存版：清零之后再失败一次是从 1 开始数", (await mem3.recordFailure("d")).failCount, 1);
+
+  // 清理必须只删陈旧行：删到活着的锁就等于把攻击者放出来（保留期大于封顶，
+  // 那条不变式在上面钉着）。这里是它的行为侧。
+  clock = T0;
+  const mem4 = createMemoryStore(policy, () => clock);
+  for (let i = 0; i < FAIL_TIER2_COUNT; i++) await mem4.recordFailure("e");
+  // 走到一把锁还活着、同时在保留期内的时刻（第 10 次失败起锁 5 分钟）
+  clock = T0 + 100_000;
+  await mem4.sweep();
+  eq("清理不会动到一把还活着的锁", await mem4.peek("e"), {
+    lockRetryAfterMs: FAIL_TIER2_LOCK_SECS * 1000 - 100_000,
+    windowCount: 0,
+    windowResetAfterMs: 0,
+  });
+
+  // ⚠️ 这里**没有**"陈旧条目被删掉了"的断言，因为删没删在这个接口上不可观测：
+  // 一个过期条目和一个不存在的条目给出的答案是同一套（锁早到期、窗口早翻滚）。
+  // 那正是这个接口该有的性质——清理不允许改变任何行为。所以能测的只有上面那条
+  // "不许删到活的"，以及"重复跑、空表跑都不抛错"（抛了的话这一行就过不去）。
+
+  // ---- 持久化模式的探测 ---------------------------------------------------
+  // ⚠️ 这一段必须排在下面「降级」之前。persistenceMode() 除了看环境变量，还看
+  // "最近有没有报过数据库故障"，而下面那段会故意制造故障、把那个时间戳写脏。
+  // 顺序颠过来的话，最后那条"真的连接串 → postgres 模式"会红，而原因跟
+  // 连接串一点关系都没有。
+  //
+  // 占位串必须被当成"没配"：它非空、长得也像连接串，会被朴素的存在性检查放过——
+  // 于是站点报"持久化已启用"，实际指向一个不存在的库，然后每个请求都静默降级。
+  // 这是 lib/access.ts 里 change-me-please 那个坑的同一个形状。
+  const savedUrl = process.env.DATABASE_URL;
+  try {
+    delete process.env.DATABASE_URL;
+    eq("没配 DATABASE_URL → 内存模式", persistenceMode(), "memory");
+
+    process.env.DATABASE_URL = "";
+    eq("空值 → 内存模式", persistenceMode(), "memory");
+
+    process.env.DATABASE_URL = "postgresql://user:password@host/db";
+    eq(".env.local.example 里的占位串 → 内存模式（不能当成配了）", persistenceMode(), "memory");
+
+    process.env.DATABASE_URL = "postgresql://neon:secret@ep-cool-1234.us-east-2.aws.neon.tech/neondb?sslmode=require";
+    eq("真的连接串 → postgres 模式", persistenceMode(), "postgres");
+
+    process.env.DATABASE_URL = "redis://localhost:6379";
+    eq("不是 postgres 协议 → 内存模式", persistenceMode(), "memory");
+  } finally {
+    if (savedUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = savedUrl;
+  }
+
+  // ---- 降级 ---------------------------------------------------------------
+  // 数据库挂了必须**放行**（不能让站点整个不可用），但放行的方式不是"零限制"，
+  // 而是退回内存实现。下面断言的是后者：降级之后 fallback 里真的有计数。
+  clock = T0;
+  const fallback = createMemoryStore(policy, () => clock);
+  let dbCalls = 0;
+  const broken = {
+    policy,
+    async peek() {
+      dbCalls++;
+      throw new Error("模拟数据库不可用");
+    },
+    async recordFailure() {
+      dbCalls++;
+      throw new Error("模拟数据库不可用");
+    },
+    async recordSuccess() {
+      dbCalls++;
+      throw new Error("模拟数据库不可用");
+    },
+    async sweep() {
+      dbCalls++;
+      throw new Error("模拟数据库不可用");
+    },
+  };
+  const degraded = withFallback(broken, fallback);
+
+  const originalError = console.error;
+  const logged: string[] = [];
+  console.error = (...args: unknown[]) => logged.push(args.join(" "));
+  let degradedOk: unknown;
+  let degradedFail: unknown;
+  try {
+    degradedOk = await degraded.recordSuccess("f");
+    degradedFail = await degraded.recordFailure("f");
+    await degraded.peek("f");
+    await degraded.sweep();
+  } finally {
+    console.error = originalError;
+  }
+
+  eq("降级：主实现被调用过", dbCalls, 4);
+  eq("降级：走的是内存实现，计数照样在涨", degradedOk, { windowCount: 1, windowResetAfterMs: policy.reviewWindowSecs * 1000 });
+  eq("降级：失败也在内存里记着（计数从 1 开始）", (degradedFail as { failCount: number }).failCount, 1);
+  check("降级是**响的**：打了告警日志", logged.length > 0, logged);
+  check(
+    "告警文案点明了降级的后果（多实例下会漏）",
+    logged.some((line) => line.includes("降级") && line.includes("漏")),
+    logged,
+  );
+
+  // 同一条告警不能刷屏：60 秒内的重复故障要折叠
+  const before = logged.length;
+  const originalError2 = console.error;
+  console.error = (...args: unknown[]) => logged.push(args.join(" "));
+  try {
+    await degraded.peek("f");
+    await degraded.peek("f");
+  } finally {
+    console.error = originalError2;
+  }
+  eq("降级：60 秒内的重复故障被折叠，不再打日志", logged.length, before);
+
+  // 日志可以折叠，但"现在正降级着"这件事不能——页面上的黄色提示就是靠它亮起来的。
+  // 只判环境变量的话，"库挂了"只存在于没人看服务端日志的地方，而限流已经在漏了
+  const savedUrlForDegrade = process.env.DATABASE_URL;
+  try {
+    process.env.DATABASE_URL = "postgresql://neon:secret@ep-cool-1234.us-east-2.aws.neon.tech/neondb?sslmode=require";
+    eq(
+      "刚发生过故障时，persistence 报 memory（连接串配得好好的也没用）",
+      persistenceMode(),
+      "memory",
+    );
+  } finally {
+    if (savedUrlForDegrade === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = savedUrlForDegrade;
+  }
+
+  // ---- 环境变量 -----------------------------------------------------------
+  // ⚠️ 存/取/恢复。少了恢复这一段，后面所有 section 都会跑在被污染的环境里
+  // （REVIEW_RATE_LIMIT_PER_HOUR 被留成 "42" 之类），而且症状是别的测试失败。
+  const savedLimit = process.env.REVIEW_RATE_LIMIT_PER_HOUR;
+  const savedDelay = process.env.ACCESS_CODE_FAIL_DELAY_MS;
+  try {
+    process.env.REVIEW_RATE_LIMIT_PER_HOUR = "not-a-number";
+    eq("非法环境变量回落默认值", configFromEnv().reviewLimit, 100);
+    process.env.REVIEW_RATE_LIMIT_PER_HOUR = "42";
+    eq("合法环境变量生效", configFromEnv().reviewLimit, 42);
+    process.env.REVIEW_RATE_LIMIT_PER_HOUR = "-1";
+    eq("负数环境变量回落默认值（不能把额度拧成负的）", configFromEnv().reviewLimit, 100);
+    process.env.REVIEW_RATE_LIMIT_PER_HOUR = "0";
+    eq("0 是合法值，表示不限", configFromEnv().reviewLimit, 0);
+    process.env.ACCESS_CODE_FAIL_DELAY_MS = "-5";
+    eq("负的失败延迟回落默认值", configFromEnv().failDelayMs, 400);
+    eq("窗口长度是代码里定的，不受环境变量影响", configFromEnv().reviewWindowSecs, HOUR_SECS);
+  } finally {
+    if (savedLimit === undefined) delete process.env.REVIEW_RATE_LIMIT_PER_HOUR;
+    else process.env.REVIEW_RATE_LIMIT_PER_HOUR = savedLimit;
+    if (savedDelay === undefined) delete process.env.ACCESS_CODE_FAIL_DELAY_MS;
+    else process.env.ACCESS_CODE_FAIL_DELAY_MS = savedDelay;
+  }
+
+  // ---- 取 IP --------------------------------------------------------------
   // 取 IP：x-forwarded-for 是逗号分隔的链，第一项才最接近客户端
   const reqWith = (h: Record<string, string>) =>
     new Request("http://localhost/api/review", { method: "POST", headers: h });

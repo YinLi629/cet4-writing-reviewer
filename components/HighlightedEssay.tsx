@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 import { segmentEssay } from "@/lib/highlight";
 import { KIND_LABEL } from "@/lib/labels";
 import type { Evidence } from "@/lib/types";
@@ -21,16 +19,27 @@ export function HighlightedEssay({
   essay: string;
   evidence: Evidence[];
 }) {
-  const [flashId, setFlashId] = useState<string | null>(null);
   const segments = segmentEssay(essay, evidence);
   const located = evidence.filter((e) => e.verified).length;
 
+  /**
+   * 跳到对应证据卡片，并让它闪一下。
+   *
+   * 闪烁直接改那张卡片的 class（.is-flash，见 globals.css）。原先的做法是往 DOM 里
+   * 注入一个 <style> 标签——因为证据卡片在 EvidenceList 里，两个组件没有共享状态。
+   * 那条路会在 DOM 里留下一堆只为一处高亮存在的 style 元素，改 class 就够了。
+   */
   const jumpToCard = (id: string) => {
     const el = document.getElementById(`card-${id}`);
     if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    setFlashId(id);
-    window.setTimeout(() => setFlashId((cur) => (cur === id ? null : cur)), 1600);
+    // 系统开了"减少动态效果"就不要平滑滚动：真正难受的是那段位移，不是闪烁
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+
+    el.classList.remove("is-flash");
+    void el.offsetWidth; // 强制回流：连着点同一个高亮两次，动画也要能重放
+    el.classList.add("is-flash");
+    window.setTimeout(() => el.classList.remove("is-flash"), 1600);
   };
 
   return (
@@ -82,10 +91,6 @@ export function HighlightedEssay({
           {evidence.length > located ? `，${evidence.length - located} 条未能定位` : ""}
         </span>
       </div>
-
-      {flashId && (
-        <style>{`#card-${CSS.escape(flashId)} { box-shadow: 0 0 0 3px var(--accent-soft); }`}</style>
-      )}
     </>
   );
 }

@@ -1,20 +1,28 @@
 /* ==========================================================================
    设计令牌 + 共享组件类
    全站唯一一份样式来源。组件里只用这里的 class，不写行内配色。
+
+   风格是「奶油米白 + 薄荷绿」的柔和教育风：暖白底、暖色发丝线，主色是
+   **浅薄荷底配深青字**（不是饱和底色配白字）。证据三色（strength/minor/major）
+   是语义色，不参与风格化——它们是高亮底和徽章的承重色，对比度不拿来冒险。
    ========================================================================== */
 
 :root {
-  --ink: #17171a;
-  --ink-2: #3d3d44;
-  --muted: #71717a;
-  --line: #e4e4e7;
-  --line-strong: #d4d4d8;
-  --bg: #faf9f7;
+  color-scheme: light;
+
+  --ink: #2c2436;
+  --ink-2: #55495f;
+  --muted: #6f6478;
+  --line: #ebe2d9;
+  --line-strong: #d9cec2;
+  --bg: #faf7f4;
   --surface: #ffffff;
-  --surface-2: #f4f4f5;
-  --accent: #1f6feb;
-  --accent-ink: #ffffff;
-  --accent-soft: #eaf1fe;
+  --surface-2: #f3ede6;
+  --accent: #5fd8c4;
+  --accent-ink: #0c4a45;
+  --accent-soft: #dcf5ef;
+  /* 链接和焦点环不能用 --accent：薄荷绿在奶油底上读不清，要更深的青 */
+  --link: #0f766e;
 
   --strength: #15803d;
   --strength-bg: #e9f7ef;
@@ -28,43 +36,96 @@
   --major-bg: #fdeceb;
   --major-line: #f0a9a3;
 
-  --radius: 10px;
-  --radius-sm: 6px;
-  --shadow: 0 1px 2px rgba(24, 24, 27, 0.04), 0 4px 12px rgba(24, 24, 27, 0.05);
+  --radius: 16px;
+  --radius-sm: 10px;
+  /* 按钮/单行输入用这个。多行输入框用药丸是坏的，见 .textarea */
+  --radius-field: 999px;
+  /* 阴影带暖色调：灰色的阴影落在奶油底上会发脏 */
+  --shadow: 0 1px 2px rgba(58, 42, 32, 0.05), 0 4px 12px rgba(58, 42, 32, 0.06);
+  --shadow-lift: 0 2px 4px rgba(58, 42, 32, 0.06), 0 14px 30px rgba(58, 42, 32, 0.1);
+  --glow-accent: 0 6px 18px -6px rgba(95, 216, 196, 0.65);
+
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-1: 0.15s;
+  --dur-2: 0.28s;
+  --dur-3: 0.6s;
+
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
     "PingFang SC", "Hiragino Sans GB", sans-serif;
-  --font-serif: Georgia, "Times New Roman", "Songti SC", serif;
+  /*
+   * 只给英文正文和引文用（.textarea-essay / .essay-box / blockquote.quote），
+   * 也正是参考站用衬线的地方。正文本来就是英文作文，Georgia 在屏幕上够好。
+   *
+   * **刻意不引衬线 webfont。** 拉丁衬线的收益太小，而代价是让每次构建都依赖外网；
+   * 中文衬线更不能引——Google 的 CJK 字体按 unicode-range 切成几十个分片，
+   * next/font 对它的子集元数据是错的（vercel/next.js#53522），会把所有分片拖下来。
+   * 所以标题一律留在无衬线里：Windows 上衬线中文只能回落到宋体，
+   * 那是另一种风格（老门户/论坛那种），不是参考站那种。
+   * 真想做得和参考站一样，正确做法是用 pyftsubset 把标题那几十个字切成一个
+   * 子集 woff2 自己托管，见 README。
+   */
+  --font-serif: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+  /*
+   * 首页标题的花体。同样是系统栈、同样不引 webfont（理由见上面 --font-serif）。
+   * 排在前面的在 Windows 上都不存在，会落到 Segoe Script / Ink Free；
+   * macOS 命中 Snell Roundhand。Linux 上 cursive 由系统决定，可能不是花体。
+   */
+  --font-script: "Snell Roundhand", "Segoe Script", "Apple Chancery", "Brush Script MT",
+    "Ink Free", "Gabriola", "URW Chancery L", cursive;
+
+  /* 首页中间压底渐隐的颜色。做成令牌是为了深色主题能跟着换 */
+  --veil: rgba(250, 247, 244, 0.9);
+
+  /*
+   * 顶栏总高 = 58px 内容行 + 1px 下边框（见 .site-header-inner 的 min-height）。
+   * 首页要拿它算"一屏"：顶栏是 sticky 的、占着文档流，不减掉这一截首页就会多出
+   * 一条 59px 的滚动条。两个值是绑在一起的，改一个要改另一个。
+   */
+  --header-h: 59px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --ink: #ededf0;
-    --ink-2: #c4c4cc;
-    --muted: #8e8e99;
-    --line: #2c2c33;
-    --line-strong: #3d3d45;
-    --bg: #131316;
-    --surface: #1b1b1f;
-    --surface-2: #232329;
-    --accent: #5b9dff;
-    --accent-ink: #0b1220;
-    --accent-soft: #1b2740;
+/*
+ * 深色主题。这一份令牌只有这一个选择器：app/layout.tsx 里那段内联脚本
+ * **总会**给 <html> 写上 data-theme（localStorage 里有就用它，没有就问
+ * prefers-color-scheme），所以不需要再写一份 @media 的令牌副本，
+ * 也就不会有"两份深色值慢慢漂开"的问题。
+ * 代价是无 JS 时只有浅色——而这个 app 没有 JS 本来就是个空壳（表单、fetch、
+ * sessionStorage 全靠它），不值得为它维护第二份深色令牌。
+ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
 
-    --strength: #4ade80;
-    --strength-bg: #12291c;
-    --strength-line: #2c6b45;
+  --ink: #f3efe9;
+  --ink-2: #cbc4d1;
+  --muted: #9a92a5;
+  --line: #2e2b36;
+  --line-strong: #443f4e;
+  --bg: #16151a;
+  --surface: #1e1d24;
+  --surface-2: #272530;
+  --accent: #5fd8c4;
+  --accent-ink: #08201d;
+  --accent-soft: #12332f;
+  --link: #7fe3d3;
 
-    --minor: #fbbf24;
-    --minor-bg: #2b2211;
-    --minor-line: #6b5522;
+  --strength: #4ade80;
+  --strength-bg: #12291c;
+  --strength-line: #2c6b45;
 
-    --major: #f87171;
-    --major-bg: #2c1616;
-    --major-line: #6b2d2d;
+  --minor: #fbbf24;
+  --minor-bg: #2b2211;
+  --minor-line: #6b5522;
 
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.35);
-  }
+  --major: #f87171;
+  --major-bg: #2c1616;
+  --major-line: #6b2d2d;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 14px rgba(0, 0, 0, 0.4);
+  --shadow-lift: 0 2px 6px rgba(0, 0, 0, 0.4), 0 18px 36px rgba(0, 0, 0, 0.45);
+  --veil: rgba(22, 21, 26, 0.92);
+  --glow-accent: 0 6px 20px -6px rgba(95, 216, 196, 0.4);
 }
 
 * {
@@ -77,16 +138,70 @@ body {
   margin: 0;
 }
 
-body {
+/*
+ * 底色挂在 html 上、body 不留背景颜色：这样下面那层光晕（z-index:-1）
+ * 正好落在「底色之上、内容之下」，不用靠 position 或隔离去兜。
+ */
+html {
   background: var(--bg);
+}
+
+body {
   color: var(--ink);
   font-family: var(--font);
   line-height: 1.7;
   -webkit-font-smoothing: antialiased;
 }
 
+/* 背景光晕：三团很淡的径向渐变，固定在视口上慢慢漂。打印时关掉 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -12%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(38% 42% at 16% 6%, rgba(95, 216, 196, 0.3), transparent 72%),
+    radial-gradient(34% 38% at 84% 2%, rgba(244, 178, 205, 0.26), transparent 72%),
+    radial-gradient(30% 34% at 52% 0%, rgba(255, 214, 140, 0.2), transparent 70%);
+  animation: drift 22s ease-in-out infinite alternate;
+}
+
+/* 深色底上同样的三团要压到几乎看不见，否则像屏幕漏光 */
+:root[data-theme="dark"] body::before {
+  background:
+    radial-gradient(38% 42% at 16% 6%, rgba(95, 216, 196, 0.13), transparent 72%),
+    radial-gradient(34% 38% at 84% 2%, rgba(186, 128, 214, 0.12), transparent 72%),
+    radial-gradient(30% 34% at 52% 0%, rgba(255, 190, 120, 0.07), transparent 70%);
+}
+
+/*
+ * 这里原本有一条 :root[data-theme="dark"] .meme-wall { opacity: 0.5 }。
+ * 删掉是因为墙上的猫换了：以前是彩色 emoji，浅色贴纸压在近黑底上像霉点，得压一半；
+ * 现在猫的颜色跟着主题翻转（浅色主题是深墨、深色主题是浅墨），两边的对比其实相当，
+ * 再压一半反而让深色下的墙几乎看不见了。
+ */
+
+@keyframes drift {
+  from {
+    transform: translate3d(-1.5%, -1%, 0) scale(1.02);
+  }
+  to {
+    transform: translate3d(1.5%, 1.5%, 0) scale(1.06);
+  }
+}
+
 a {
-  color: var(--accent);
+  color: var(--link);
+}
+
+/*
+ * 全站统一的键盘焦点环。用 :where() 把特异度压成 0，组件自己的规则随时能盖掉它。
+ * 之前全站只有输入框有焦点样式，按钮和可聚焦的 <mark> 用键盘走一遍完全看不出来。
+ */
+:where(a, button, summary, [tabindex], [role="button"]):focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: 2px;
 }
 
 /* ---------- 布局 ---------- */
@@ -109,16 +224,34 @@ a {
   z-index: 20;
 }
 
+/*
+ * 玻璃拟态顶栏。backdrop-filter 和 color-mix 是同一批浏览器给的，所以放在
+ * 同一个 @supports 里一起兜底：不支持就老实回到上面那个不透明底，
+ * 而不是变成半透明糊字。
+ */
+@supports (backdrop-filter: blur(2px)) and (background: color-mix(in srgb, red 70%, transparent)) {
+  .site-header {
+    background: color-mix(in srgb, var(--surface) 74%, transparent);
+    backdrop-filter: blur(12px) saturate(1.4);
+  }
+}
+
 .site-header-inner {
   max-width: 960px;
   margin: 0 auto;
-  padding: 14px 20px;
+  padding: 12px 20px;
+  /* 把高度钉死（最少装得下 34px 的开关）。首页的"一屏"按 --header-h 算，
+     不钉的话高度会随字体和缩放漂移，那笔账就对不上了 */
+  min-height: 58px;
   display: flex;
   align-items: center;
   gap: 14px;
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
   font-weight: 700;
   font-size: 16px;
   color: var(--ink);
@@ -126,32 +259,457 @@ a {
   letter-spacing: -0.01em;
 }
 
+/* 站标：薄荷渐变方块 + 一个深青对勾，和 favicon（app/icon.svg）是同一个图案 */
+.brand-mark {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background: linear-gradient(140deg, var(--accent), #a9eddf);
+  color: var(--accent-ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--glow-accent);
+}
+
+.brand-mark svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
 .brand span {
   color: var(--muted);
   font-weight: 400;
   font-size: 13px;
-  margin-left: 8px;
 }
 
 .header-spacer {
   flex: 1;
 }
 
+/* 主题切换：太阳/月亮都是 CSS 画的，没有图标库 */
+.theme-toggle {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--dur-1) var(--ease), background var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+.theme-toggle:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+  transform: translateY(-1px);
+}
+
+.theme-toggle .icon-sun,
+.theme-toggle .icon-moon {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+/* 浅色下亮着月亮（点它变深色），深色下亮着太阳 */
+.theme-toggle .icon-sun {
+  display: none;
+  background: radial-gradient(circle at 34% 30%, #ffe9a8, #eaa72a 72%);
+  box-shadow: 0 0 0 3px rgba(234, 167, 42, 0.2);
+}
+
+.theme-toggle .icon-moon {
+  /* 一个圆被另一个圆"咬掉"一口就是月牙，用遮罩做，不用两片圆去叠 */
+  background: var(--ink-2);
+  -webkit-mask-image: radial-gradient(circle at 72% 28%, transparent 50%, #000 51%);
+  mask-image: radial-gradient(circle at 72% 28%, transparent 50%, #000 51%);
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-sun {
+  display: block;
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-moon {
+  display: none;
+}
+
 .hero {
-  padding: 40px 0 24px;
+  padding: 52px 0 26px;
 }
 
 .hero h1 {
-  font-size: 28px;
-  margin: 0 0 10px;
+  font-size: 34px;
+  line-height: 1.25;
+  margin: 0 0 12px;
   letter-spacing: -0.02em;
 }
 
 .hero p {
   color: var(--muted);
   margin: 0;
-  font-size: 15px;
+  font-size: 15.5px;
   max-width: 62ch;
+}
+
+/*
+ * hero 三段错开进场。用纯 CSS 关键帧而不是滚动进场组件：
+ * 它是首屏内容，走 JS 就得等水合，等于先白一下再动。
+ * 延迟 70ms 一档，三段的先后关系看得出来，又不至于让人等。
+ */
+.hero h1,
+.hero p,
+.hero-chips {
+  animation: rise var(--dur-3) var(--ease-out) both;
+}
+
+.hero p {
+  animation-delay: 70ms;
+}
+
+/* 首页 hero 下面那三个特性胶囊 */
+.hero-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+  animation-delay: 140ms;
+}
+
+.hero-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 14px 5px 11px;
+  box-shadow: var(--shadow);
+}
+
+.hero-chip::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+/* ---------- 首页（开播页） ---------- */
+
+.landing {
+  position: relative;
+  min-height: calc(100vh - var(--header-h));
+  min-height: calc(100svh - var(--header-h)); /* 手机上 100vh 会被地址栏算错，svh 才是"看得见的那块" */
+  display: grid;
+  place-items: center;
+  padding: 48px 20px 72px;
+}
+
+/*
+ * 表情包墙。
+ *
+ * 做成一个固定定位的网格层，而不是 background-image：背景图得先知道视口多大、
+ * 或者要切一张正好拼得上的图；网格是自动铺满的。
+ *
+ * 贴纸数量在组件里写死（见 app/page.tsx），不量视口 —— 量了就得等客户端，
+ * 首屏会先白一下。多出来的格子被这里的 overflow 裁掉，不占版面、也不撑出滚动条。
+ * 格子是正方形（.meme 的 aspect-ratio），所以"要多少才盖满"能离线估出来。
+ */
+.meme-wall {
+  position: fixed;
+  /* 比视口大一圈：整层在慢慢漂移，贴边的话会把边露出来 */
+  inset: -28px;
+  z-index: -2;
+  overflow: hidden;
+  pointer-events: none;
+  display: grid;
+  align-content: start;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(116px, 9vw, 240px), 1fr));
+  animation: wall-drift 26s var(--ease) infinite alternate;
+}
+
+@keyframes wall-drift {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(-16px, -12px, 0);
+  }
+}
+
+/*
+ * 6 只猫只定义一次，靠 <use> 引 300 次。这个 <svg> 本身不画东西（没给宽高、
+ * 里面的 <symbol> 也从不当场渲染），但**不能写成 display:none**：
+ * 有些浏览器不会去解析 display:none 子树里的 <use> 引用，整墙会变成空白。
+ */
+.meme-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+
+/*
+ * 猫贴纸的四种"笔"。颜色不写在 SVG 里（presentation attribute 不认 var()），
+ * 全部在这里定：
+ *
+ *   .cat-body  跟 currentColor —— 由下面 .meme 的 :nth-child 决定这一格什么颜色
+ *   .cat-hole  挖成 var(--bg) —— 嘴、眼、鼻子。**不能用白色**：深色主题下
+ *              会变成一张黑脸上挂着一嘴白牙
+ *   .cat-brow  眼睛上面那道怒眉，也是挖空
+ *   .cat-mouth 抿着的嘴，是一条线
+ *   .cat-whisker 胡须伸在脑袋外面，所以必须是猫自己的颜色，挖空就看不见了
+ */
+.meme-defs .cat-body {
+  fill: currentColor;
+}
+
+.meme-defs .cat-hole {
+  fill: var(--bg);
+}
+
+.meme-defs .cat-brow {
+  fill: none;
+  stroke: var(--bg);
+  stroke-width: 4.2;
+  stroke-linecap: round;
+}
+
+.meme-defs .cat-mouth {
+  fill: none;
+  stroke: var(--bg);
+  stroke-width: 3.6;
+  stroke-linecap: round;
+}
+
+.meme-defs .cat-whisker {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+}
+
+/*
+ * 每一格。
+ *
+ * 下面七条 :nth-child 覆盖 --rot/--sc/--op，四条换 color，另六格一轮换猫——
+ * 7、4、6 三个周期互质，所以"这只猫 + 这个角度 + 这个颜色"要 84 格才撞一次，
+ * 一眼看不出排版的规律。
+ */
+.meme {
+  display: block;
+  aspect-ratio: 1;
+  user-select: none;
+
+  --rot: 0deg;
+  --sc: 1;
+  --op: 0.14;
+  opacity: var(--op);
+  transform: rotate(var(--rot)) scale(var(--sc));
+}
+
+.meme > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+/* 换色只挑会在深浅两套主题里各自翻转的令牌。--accent 那种浅薄荷在浅色主题下
+   压到 15% 透明度就彻底看不见了；--muted/--ink-2 是同一族的两级灰紫，凑数用的。 */
+.meme:nth-child(4n + 1) {
+  color: var(--ink);
+}
+
+.meme:nth-child(4n + 2) {
+  color: var(--link);
+}
+
+.meme:nth-child(4n + 3) {
+  color: var(--muted);
+}
+
+.meme:nth-child(4n + 4) {
+  color: var(--ink-2);
+}
+
+.meme:nth-child(7n + 1) {
+  --rot: -13deg;
+  --sc: 1.08;
+  --op: 0.21;
+}
+
+.meme:nth-child(7n + 2) {
+  --rot: 9deg;
+  --sc: 0.94;
+  --op: 0.15;
+}
+
+.meme:nth-child(7n + 3) {
+  --rot: -4deg;
+  --sc: 1.14;
+  --op: 0.18;
+}
+
+.meme:nth-child(7n + 4) {
+  --rot: 16deg;
+  --sc: 0.9;
+  --op: 0.14;
+}
+
+.meme:nth-child(7n + 5) {
+  --rot: 2deg;
+  --sc: 1.02;
+  --op: 0.2;
+}
+
+.meme:nth-child(7n + 6) {
+  --rot: -19deg;
+  --sc: 0.97;
+  --op: 0.16;
+}
+
+.meme:nth-child(7n + 7) {
+  --rot: 11deg;
+  --sc: 1.1;
+  --op: 0.19;
+}
+
+/*
+ * 视线中心压一层底色渐隐。这是"清新"的关键：表情包只在四周清楚，
+ * 中间永远是干净的奶油底，所以标题怎么都不会读不清，也不需要给文字加底板。
+ */
+.landing::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    62% 56% at 50% 46%,
+    var(--veil) 0%,
+    var(--veil) 38%,
+    transparent 100%
+  );
+}
+
+.landing-inner {
+  position: relative;
+  max-width: 780px;
+  text-align: center;
+}
+
+.live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-field);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--major);
+  animation: pulse-soft 1.6s var(--ease) infinite;
+}
+
+/* 花体英文。字体栈全部是系统自带的花体/手写体，不引 webfont —— 理由同 --font-serif：
+   拉丁花体的收益配不上"每次构建都依赖外网"这个代价。代价是具体字形跟着操作系统走，
+   想固定成一种，就往 public/fonts/ 里放一个子集 woff2 再 @font-face，见 README。 */
+.script-title {
+  margin: 18px 0 0;
+  font-family: var(--font-script);
+  font-weight: 400;
+  font-size: clamp(46px, 8.6vw, 96px);
+  line-height: 1.06;
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+.script-line-2 {
+  display: block;
+  margin-top: -0.04em;
+  font-size: 0.72em;
+  color: var(--link);
+  transform: rotate(-1.6deg);
+}
+
+.swash {
+  display: block;
+  width: min(340px, 72%);
+  margin: 4px auto 0;
+  color: var(--accent);
+}
+
+.landing-caption {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+
+.landing-cta {
+  margin-top: 28px;
+}
+
+.landing-note {
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 从上往下一层层落进来。按钮排在最后，等你看完那句话再请它出场 */
+.live-pill,
+.script-title,
+.swash,
+.landing-caption,
+.landing-cta,
+.landing-note {
+  animation: rise var(--dur-3) var(--ease-out) both;
+}
+
+.script-title {
+  animation-delay: 70ms;
+}
+
+.swash {
+  animation-delay: 150ms;
+}
+
+.landing-caption {
+  animation-delay: 210ms;
+}
+
+.landing-cta {
+  animation-delay: 280ms;
+}
+
+.landing-note {
+  animation-delay: 340ms;
 }
 
 /* ---------- 卡片 ---------- */
@@ -164,27 +722,54 @@ a {
   margin-bottom: 14px;
 }
 
-.card-tight {
-  padding: 14px 16px;
+/* 所有"卡片"共用一层很浅的暖色投影，做出纸片浮起的感觉 */
+.card,
+.score-main,
+.band-desc,
+.dim-card,
+.ev-card,
+.up-card,
+.essay-box {
+  box-shadow: var(--shadow);
 }
 
 .section-title {
   font-size: 15px;
   font-weight: 700;
   margin: 34px 0 12px;
-  padding-bottom: 8px;
-  border-bottom: 2px solid var(--line);
+  padding-bottom: 9px;
   letter-spacing: -0.01em;
+  /* 底线从薄荷淡出到发丝线，比一条纯色横线有精神 */
+  background-image: linear-gradient(90deg, var(--accent), var(--line) 140px, var(--line));
+  background-repeat: no-repeat;
+  background-position: left bottom;
+  background-size: 100% 2px;
 }
 
-.section-title:first-child {
-  margin-top: 0;
+/* 标题旁边那句说明小字 */
+.section-sub {
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--muted);
+  margin-left: 10px;
 }
+
+/*
+ * 这里原本有一条 .section-title:first-child { margin-top: 0 }。删掉是因为
+ * .reveal 会给每块内容套一层 div，于是每个小标题都成了"它那层 div 的第一个孩子"，
+ * 这条规则会让所有分节标题的上间距一起消失、整页挤成一坨。
+ * 它原本要处理的场景（标题是页面第一个元素）现在由 .hero 的下内边距负责。
+ */
 
 /* ---------- 按钮 ---------- */
 
 .btn {
   appearance: none;
+  /* 显式 inline-flex：`<Link className="btn">` 渲染出来是 <a>，行内元素的
+     垂直内边距和 margin-top 都不作数，药丸会变成半个 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line-strong);
   background: var(--surface);
   color: var(--ink);
@@ -192,9 +777,11 @@ a {
   font-size: 14px;
   font-weight: 500;
   padding: 9px 18px;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-field);
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease), opacity var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
   text-decoration: none;
   display: inline-flex;
   align-items: center;
@@ -204,7 +791,14 @@ a {
 
 .btn:hover:not(:disabled) {
   background: var(--surface-2);
-  border-color: var(--muted);
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: none;
 }
 
 .btn:disabled {
@@ -214,15 +808,18 @@ a {
 
 .btn-primary {
   background: var(--accent);
-  border-color: var(--accent);
+  border-color: transparent;
   color: var(--accent-ink);
   font-weight: 600;
+  box-shadow: var(--glow-accent);
 }
 
 .btn-primary:hover:not(:disabled) {
   background: var(--accent);
-  border-color: var(--accent);
-  filter: brightness(1.1);
+  border-color: transparent;
+  /* 薄荷底已经够亮，hover 要"压深"而不是提亮 */
+  filter: brightness(0.97);
+  box-shadow: 0 8px 24px -6px rgba(95, 216, 196, 0.85);
 }
 
 .btn-lg {
@@ -271,23 +868,30 @@ a {
   color: var(--ink);
   background: var(--surface);
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  transition: border-color 0.12s, box-shadow 0.12s;
+  border-radius: var(--radius-field);
+  padding: 10px 14px;
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
 
+/*
+ * 焦点环用深青描边 + 薄荷光晕：只靠 --accent-soft 那圈浅薄荷在奶油底上太淡，
+ * 键盘用户看不出焦点在哪（浅色 #dcf5ef 对白底远不到 3:1）。
+ */
 .input:focus,
 .textarea:focus,
 .select:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--link);
+  box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
 .textarea {
   min-height: 300px;
   resize: vertical;
   line-height: 1.85;
+  /* 多行输入框不能用药丸圆角：会切掉第一行开头和最后一行结尾 */
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
 }
 
 .textarea-essay {
@@ -351,7 +955,8 @@ a {
 
 .chip-accent {
   background: var(--accent-soft);
-  color: var(--accent);
+  /* 薄荷绿当文字色在浅底上读不清，用深一档的青 */
+  color: var(--link);
   border-color: transparent;
 }
 
@@ -375,12 +980,6 @@ a {
   background: var(--minor-bg);
   border-color: var(--minor-line);
   color: var(--ink);
-}
-
-.alert-info {
-  background: var(--accent-soft);
-  border-color: transparent;
-  color: var(--ink-2);
 }
 
 .alert strong {
@@ -427,11 +1026,34 @@ a {
 }
 
 .score-big {
-  font-size: 52px;
+  font-size: 56px;
   font-weight: 700;
   line-height: 1;
   letter-spacing: -0.03em;
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 分数落定：一次性放大到位。
+ *
+ * **刻意不做数字滚动。** 滚动会短暂显示 0 → 4 → 9 → 13 这些中间值，而"分数一出现
+ * 就是终值"是流式那边定过的规矩（服务端还会按 major 条数做上限校正，13 可能变 12）。
+ * 同一个理由，统计数字也不做 count-up——156 词是量出来的，不该先报一个假的。
+ * 整个站点因此有一条一致的脾气：**显示出来的数字永远是真的**。
+ */
+.score-settled {
+  animation: settle var(--dur-3) var(--ease-out) both;
+}
+
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .score-big small {
@@ -443,8 +1065,8 @@ a {
 
 /*
  * 流式批改期间的记分板：位置先占住，数字还没到时候（分数要等上限校正，
- * 提前显示会当场跳一次）。缩字号是因为"计算中"三个字按 52px 排会撑破数字位，
- * min-height 对齐 52px 的数字高度，跳到结果页时版块上下不跳。
+ * 提前显示会当场跳一次）。缩字号是因为"计算中"三个字按 56px 排会撑破数字位，
+ * min-height 必须等于 .score-big 的行高，跳到结果页时版块上下才不跳。
  */
 .score-big-pending {
   font-size: 20px;
@@ -453,7 +1075,7 @@ a {
   letter-spacing: 0;
   display: flex;
   align-items: center;
-  min-height: 52px;
+  min-height: 56px;
 }
 
 .score-big-pending small {
@@ -523,13 +1145,16 @@ a {
 
 .dims {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* minmax(0,1fr) 不能省：默认的 min-width:auto 会让一段没有空格的
+     长串（英文长单词、URL）把整列撑破 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 
-@media (max-width: 720px) {
+/* 卡里是一整段中文诊断，到 860px 以下三列就挤了，直接退成一列 */
+@media (max-width: 860px) {
   .dims {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -557,9 +1182,9 @@ a {
 }
 
 .meter {
-  height: 6px;
+  height: 8px;
   background: var(--surface-2);
-  border-radius: 3px;
+  border-radius: 999px;
   overflow: hidden;
   margin-bottom: 11px;
 }
@@ -567,9 +1192,17 @@ a {
 .meter i {
   display: block;
   height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  transition: width 0.4s ease;
+  background: linear-gradient(90deg, var(--accent), #a9eddf);
+  border-radius: 999px;
+  transition: width var(--dur-3) var(--ease-out);
+  /* 从 0 长到行内 style 里那个宽度：这里只声明起点，终点由数据给 */
+  animation: grow var(--dur-3) var(--ease-out);
+}
+
+@keyframes grow {
+  from {
+    width: 0;
+  }
 }
 
 .dim-comment {
@@ -595,6 +1228,27 @@ a {
   border-radius: var(--radius);
   padding: 16px 18px;
   margin-bottom: 12px;
+  transition: transform var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
+}
+
+.ev-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lift);
+}
+
+/*
+ * 点原文高亮跳过来的目标卡片。:target 管真正的锚点跳转，
+ * .is-flash 管 JS 滚动（scrollIntoView 不会改 URL，也就不会触发 :target）。
+ * 以前这个是往 DOM 里塞一个 <style> 标签实现的，现在规则就在样式表里。
+ */
+.ev-card.is-flash {
+  animation: flash 0.9s var(--ease-out);
+}
+
+@keyframes flash {
+  from {
+    box-shadow: 0 0 0 5px var(--accent-soft), var(--shadow-lift);
+  }
 }
 
 .ev-card-strength {
@@ -610,7 +1264,8 @@ a {
 }
 
 .ev-card:target {
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow-lift);
 }
 
 .ev-head {
@@ -663,6 +1318,16 @@ blockquote.quote {
   border-radius: var(--radius);
   padding: 18px;
   margin-bottom: 12px;
+  transition: transform var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
+}
+
+/*
+ * 悬浮抬升只给**可点/可跳转**的东西（证据卡、升档建议）。.card 那种纯展示容器
+ * 不给：抬一个点不动的东西是在假装它可以点，鼠标扫过整页还会一直在抖。
+ */
+.up-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lift);
 }
 
 .up-head {
@@ -823,61 +1488,66 @@ mark.ev-major {
 
 /* ---------- 加载 ---------- */
 
-.stage-list {
-  list-style: none;
-  padding: 0;
-  margin: 18px 0 0;
+/*
+ * 骨架块：文字还没到、但它的形状是已知的，就先摆几条灰条占位。
+ *
+ * 这不是进度条，也不许变成进度条——总量未知，按时间爬一条百分比是骗人
+ * （见 components/ReviewProgress.tsx 的文件头）。它只表达"内容正在来的路上"。
+ * 另外：**只在"形状已知、文字未知"的地方用**。像「定位中…」这种状态句不能
+ * 换成骨架，那是在拿灰条换掉一条真信息。
+ */
+.skeleton {
+  display: block;
+  height: 0.85em;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 0%,
+    color-mix(in srgb, var(--surface-2) 55%, var(--line)) 50%,
+    var(--surface-2) 100%
+  );
+  background-size: 220% 100%;
+  animation: shimmer 1.6s linear infinite;
 }
 
-.stage-list li {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  padding: 9px 0;
-  font-size: 14px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--line);
+/* 两行错开的宽度比一根等宽条更像"文字正在过来" */
+.skeleton + .skeleton {
+  margin-top: 9px;
 }
 
-.stage-list li:last-child {
-  border-bottom: none;
+.skeleton-line-1 {
+  width: 78%;
 }
 
-.stage-list li.active {
-  color: var(--ink);
-  font-weight: 600;
+.skeleton-line-2 {
+  width: 52%;
 }
 
-.stage-list li.done {
-  color: var(--muted);
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
 }
 
-.stage-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--line-strong);
-  flex: 0 0 auto;
+/*
+ * 「定位中…」这种状态句轻轻呼吸，表达"正在做、还没好"。
+ * 它**不能**被换成骨架：骨架的适用场景是"形状已知、文字未知"，而这里文字是已知的，
+ * 铺一条灰条反而抹掉了一条真信息（见 components/EvidenceList.tsx 的注释）。
+ */
+.pulse-soft {
+  animation: pulse-soft 1.5s ease-in-out infinite;
 }
 
-.stage-list li.active .stage-dot {
-  background: var(--accent);
-  animation: pulse 1.3s ease-in-out infinite;
-}
-
-.stage-list li.done .stage-dot {
-  background: var(--strength);
-}
-
-@keyframes pulse {
+@keyframes pulse-soft {
   0%,
   100% {
     opacity: 1;
-    transform: scale(1);
   }
   50% {
     opacity: 0.45;
-    transform: scale(0.78);
   }
 }
 
@@ -909,6 +1579,7 @@ mark.ev-major {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  margin-bottom: 18px;
 }
 
 .plain-list {
@@ -922,6 +1593,10 @@ mark.ev-major {
   text-align: center;
   padding: 64px 20px;
   color: var(--muted);
+}
+
+.empty-state .btn {
+  margin-top: 16px;
 }
 
 .empty-state h2 {
@@ -946,6 +1621,88 @@ mark.ev-major {
   font-size: 13px;
 }
 
+/* ---------- 排布小类 ----------
+ * 组件里以前散着二十多处 style={{...}}，全是为了间距、对齐、字重。
+ * 它们既违背了本文件开头那句"不写行内样式"，也没法跟着主题走。
+ * 这里按用途收成类。
+ *
+ * **动态值仍然留在行内**——维度条的宽度那种是数据，不是设计。
+ */
+
+/* 表单里"窄一点"的字段：口令、目标档次 */
+.field-narrow {
+  max-width: 320px;
+}
+
+/* 题目输入框，比正文短得多 */
+.textarea-short {
+  min-height: 84px;
+}
+
+/* 提示条里的第二段说明 */
+.alert-detail {
+  margin-top: 6px;
+}
+
+/* 卡片内部靠下、贴着底的那一块提示条 */
+.alert-inline {
+  margin-top: 16px;
+  margin-bottom: 0;
+}
+
+/* 按钮组 */
+.btn-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.progress-title {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.progress-title strong {
+  font-size: 16px;
+}
+
+.progress-sub {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.progress-actions {
+  margin-top: 18px;
+}
+
+/* 靠右的那句小字（"通常 10 秒左右"） */
+.form-note {
+  margin-left: auto;
+}
+
+.sample-label {
+  align-self: center;
+}
+
+.sample-hint {
+  font-weight: 400;
+}
+
+.report-meta {
+  margin-top: 24px;
+}
+
+.result-actions {
+  margin-bottom: 18px;
+}
+
+/* 结果页的 hero 比首页矮一截：上面没有一句话介绍要放 */
+.hero-compact {
+  padding-bottom: 14px;
+}
+
 .site-footer {
   border-top: 1px solid var(--line);
   margin-top: 48px;
@@ -955,10 +1712,80 @@ mark.ev-major {
   line-height: 1.9;
 }
 
+/* ---------- 滚动进场 ---------- */
+
+/*
+ * .reveal 的隐藏态挂在 html[data-reveal-ready] 上，那个属性由 app/layout.tsx 里
+ * 一段**阻塞式**内联脚本在首次绘制之前写上。这样两种失败都兜住了：
+ *   · 脚本没跑（无 JS、被扩展拦掉）→ 选择器不成立 → 内容正常可见，不会整页空白；
+ *   · 脚本跑了 → 隐藏态在首帧之前就位，不会先显示再藏一下。
+ *
+ * 只在 /result 和首页用。**绝不能用在流式视图上**：那里每个 SSE 帧都会换掉子节点，
+ * 进动画会被反复触发，看起来像页面在抽搐。
+ */
+html[data-reveal-ready] .reveal {
+  opacity: 0;
+  transform: translateY(14px);
+}
+
+html[data-reveal-ready] .reveal.is-in {
+  opacity: 1;
+  transform: none;
+  animation: rise var(--dur-3) var(--ease-out) both;
+  animation-delay: var(--reveal-delay, 0s);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- 减少动态效果 ---------- */
+
+/*
+ * 全站关掉动画和过渡。这不是可选项：前庭功能敏感的人会因为位移和视差眩晕。
+ * 写成统一兜底而不是逐条规则去关，是为了以后新加的动效不会漏掉。
+ *
+ * 例外是 spinner——转圈表达"还在跑"，停掉只剩一个静止的缺口圆环，看起来像坏了，
+ * 所以它只是放慢。骨架同理，压成静态浅底而不是留一个冻住的渐变。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .spinner {
+    animation-duration: 0.9s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  .skeleton,
+  .pulse-soft {
+    animation: none !important;
+  }
+
+  .skeleton {
+    background: var(--surface-2);
+  }
+}
+
 @media print {
   .site-header,
   .btn,
-  .sample-row {
+  .sample-row,
+  /* 纸上不需要表情包墙：它是屏幕上的玩笑，打出来只是一堆灰点 */
+  .meme-wall {
     display: none !important;
   }
   body {
@@ -969,5 +1796,47 @@ mark.ev-major {
   .up-card,
   .essay-box {
     break-inside: avoid;
+  }
+
+  /*
+   * 打印时必须显式关掉这些。最典型的翻车是滚动进场：IntersectionObserver
+   * 不会为了打印去触发，没进过视口的块在纸上就是一片空白。
+   */
+  .reveal,
+  html[data-reveal-ready] .reveal {
+    opacity: 1 !important;
+    transform: none !important;
+    animation: none !important;
+  }
+
+  .hero h1,
+  .hero p,
+  .hero-chips,
+  .score-settled,
+  .meter i,
+  .skeleton,
+  .pulse-soft {
+    animation: none !important;
+  }
+
+  /* 光晕、玻璃、投影都是屏幕上的事，纸上只会糊成一团灰 */
+  body::before {
+    display: none;
+  }
+
+  .site-header {
+    backdrop-filter: none;
+    background: #fff;
+  }
+
+  .card,
+  .score-main,
+  .band-desc,
+  .dim-card,
+  .ev-card,
+  .up-card,
+  .essay-box,
+  .hero-chip {
+    box-shadow: none;
   }
 }

@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "四级作文批改网站：档次判定、分数折算、证据溯源、升档建议、HTML 批改报告",
+  "engines": {
+    "node": ">=19.0.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,6 +13,10 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "selftest": "tsc scripts/selftest.ts --outDir .selftest-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node && node .selftest-build/scripts/selftest.js",
+    "db:build": "tsc scripts/db/init.ts scripts/db/smoke.ts scripts/db/walkthrough.ts --outDir .db-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node",
+    "db:init": "npm run db:build && node .db-build/scripts/db/init.js",
+    "db:smoke": "npm run db:build && node .db-build/scripts/db/smoke.js",
+    "db:walkthrough": "npm run db:build && node .db-build/scripts/db/walkthrough.js",
     "eval:build": "tsc scripts/eval/run.ts scripts/eval/analyze.ts scripts/eval/show.ts scripts/eval/compare.ts --outDir .eval-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node",
     "eval": "npm run eval:build && node .eval-build/scripts/eval/run.js",
     "eval:analyze": "node .eval-build/scripts/eval/analyze.js",
@@ -17,6 +24,7 @@
     "eval:compare": "node .eval-build/scripts/eval/compare.js"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

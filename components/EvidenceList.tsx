@@ -30,7 +30,7 @@ export function EvidenceList({ evidence }: { evidence: EvidenceListItem[] }) {
               <span className={`badge badge-${e.kind}`}>{KIND_LABEL[e.kind]}</span>
               <span className="chip">{DIMENSION_LABEL[e.dimension]}</span>
               {pending ? (
-                <span className="ev-loc">定位中…</span>
+                <span className="ev-loc pulse-soft">定位中…</span>
               ) : e.start !== null && e.end !== null ? (
                 <span className="ev-loc" title={METHOD_LABEL[e.locateMethod]}>
                   原文第 {e.start}–{e.end} 字符 · {METHOD_LABEL[e.locateMethod]}

@@ -40,7 +40,6 @@ import {
 import {
   DIMENSION_LABEL,
   DIMENSIONS,
-  MAX_ESSAY_CHARS,
   MAX_QUOTE_CHARS,
   MAX_TOPIC_CHARS,
   MIN_ESSAY_CHARS,
@@ -57,7 +56,8 @@ import {
 
 // 上限的定义搬到了 lib/types.ts（输入页也要用同一组数字，而那里是客户端
 // 可以安全导入的）。这里转出去，保持既有的 import 路径不变。
-export { MAX_ESSAY_CHARS, MAX_QUOTE_CHARS, MAX_TOPIC_CHARS, MIN_ESSAY_CHARS };
+// 作文没有字数上限，见 lib/types.ts 的说明。
+export { MAX_QUOTE_CHARS, MAX_TOPIC_CHARS, MIN_ESSAY_CHARS };
 
 export interface NormalizedInput {
   essay: string;
@@ -77,12 +77,8 @@ export function normalizeInput(body: ReviewRequest): NormalizedInput {
       `作文太短了（${essay.length} 字符）。至少要 ${MIN_ESSAY_CHARS} 个字符才能批改。`,
     );
   }
-  if (essay.length > MAX_ESSAY_CHARS) {
-    throw new LLMError(
-      "INVALID_INPUT",
-      `作文太长了（${essay.length} 字符），上限 ${MAX_ESSAY_CHARS} 字符。`,
-    );
-  }
+  // 没有上限检查：作文不限字数。拦在这里的只可能是 request-body.ts 的
+  // 128 KB 请求体上限，那一步在 JSON.parse 之前就返回 413 了，走不到这儿。
 
   const topic = typeof body?.topic === "string" ? body.topic.trim() : "";
   if (topic.length > MAX_TOPIC_CHARS) {

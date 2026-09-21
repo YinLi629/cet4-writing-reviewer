@@ -8,20 +8,33 @@
  * scripts/selftest.ts 的端到端用例是直接调 reviewEssay() 的，塞进去会带崩它们。
  *
  * 请求处理顺序是有讲究的，从便宜到贵：
- *   限流 → 锁定检查 → 读 body（带上限）→ 验口令 → 调模型
+ *   状态早拒（锁定 + 配额）→ 读 body（带上限）→ 验口令 → 记一次配额 → 调模型
  * 每一步都尽量把不该处理的请求挡在下一步之前，尤其是挡在收费的模型调用之前。
+ *
+ * 其中两处顺序是被规则本身决定的，不是随手排的：
+ *
+ * - **配额判定在验口令之后**。错口令的那几次不占 100 次额度（两道限制各管各的），
+ *   所以判定只能等口令过了再做。副作用：作文因为太短在 lib/review.ts 的
+ *   normalizeInput 里被拒（400）时，这一次**已经**计进 100 了。对外只能说
+ *   "口令通过的请求才计数"，不能说"真正调用了模型才计数"。
+ * - **第 ④ 步一条语句里同时清零失败计数和自增配额**。口令正确有两个后果，压成一条
+ *   语句既省一次往返，也让它们在同一把行锁上原子生效——不然会有一个可观测的中间态。
+ *
+ * 第 ① 步的早拒读的是**上一次**留下的状态，它只负责省掉一次 body 解析。权威判定是
+ * 第 ④ 步那条写语句的 RETURNING（自增和判定在同一条原子语句里）。别把早拒当权威：
+ * 并发下它会漏，而这正是并发爆破要防的。
  */
 
 import { NextResponse } from "next/server";
 
 import { hasAccessCode, verifyAccessCode } from "@/lib/access";
 import { getModel, hasApiKey, LLMError } from "@/lib/deepseek";
-import { clientKeyFrom, sharedLimiter } from "@/lib/rate-limit";
+import { clientKeyFrom, isOverLimit } from "@/lib/rate-limit";
+import { getGate, persistenceMode } from "@/lib/rate-limit-store";
 import { readJsonBody } from "@/lib/request-body";
 import { reviewEssay, reviewEssayStream } from "@/lib/review";
 import { encodeSseFrame, SSE_RESPONSE_HEADERS } from "@/lib/sse";
 import {
-  MAX_ESSAY_CHARS,
   type ReviewErrorResponse,
   type ReviewRequest,
   type ReviewStreamEvent,
@@ -80,45 +93,46 @@ function humanizeWait(ms: number): string {
   return `${minutes} 分钟`;
 }
 
+// isOverLimit 在 lib/rate-limit.ts —— 它是策略，放那儿自测才够得着
+
 export async function POST(request: Request) {
-  const limiter = sharedLimiter();
+  const gate = getGate();
   const clientKey = clientKeyFrom(request);
 
-  // ① 频率限制。无论口令对错都计数——否则拿错口令空刷接口就绕过去了
-  const rate = limiter.checkReview(clientKey);
-  if (!rate.allowed) {
+  // ① 状态早拒，放在读 body 之前：被锁的、超额度的调用方连解析都不该触发。
+  //    锁定排在前面是因为它的信息更具体（"输错太多次"比"太频繁"更能解释现状）。
+  const state = await gate.peek(clientKey);
+
+  if (state.lockRetryAfterMs > 0) {
     return errorResponse(
       "RATE_LIMITED",
-      `批改请求太频繁了，请 ${humanizeWait(rate.retryAfterMs)}后再试。`,
-      { "Retry-After": String(Math.ceil(rate.retryAfterMs / 1000)) },
+      `访问口令连续输错太多次，已暂时锁定，请 ${humanizeWait(state.lockRetryAfterMs)}后再试。`,
+      { "Retry-After": String(Math.ceil(state.lockRetryAfterMs / 1000)) },
+    );
+  }
+  // +1：peek 读到的计数不含当前这个请求（见 isOverLimit）
+  if (isOverLimit(gate.policy.reviewLimit, state.windowCount + 1)) {
+    return errorResponse(
+      "RATE_LIMITED",
+      `批改请求太频繁了，请 ${humanizeWait(state.windowResetAfterMs)}后再试。`,
+      { "Retry-After": String(Math.ceil(state.windowResetAfterMs / 1000)) },
     );
   }
 
-  // ② 锁定检查放在读 body 之前：被锁的调用方连解析都不该触发。
-  //    这一层挡的是"同一个 IP 反复猜口令"，正常用户碰不到。
-  const lock = limiter.lockState(clientKey);
-  if (!lock.allowed) {
-    return errorResponse(
-      "RATE_LIMITED",
-      `访问口令连续输错太多次，已暂时锁定，请 ${humanizeWait(lock.retryAfterMs)}后再试。`,
-      { "Retry-After": String(Math.ceil(lock.retryAfterMs / 1000)) },
-    );
-  }
-
-  // ③ 读 body，带硬性大小上限。注意必须跑在 JSON.parse 之前——
+  // ② 读 body，带硬性大小上限。注意必须跑在 JSON.parse 之前——
   //    见 lib/request-body.ts 顶部注释
   const read = await readJsonBody(request);
   if (!read.ok) {
     return read.reason === "TOO_LARGE"
       ? errorResponse(
           "PAYLOAD_TOO_LARGE",
-          `请求体太大了。作文字数上限是 ${MAX_ESSAY_CHARS} 字符，如果没超，请检查是不是多带了别的内容。`,
+          "请求体太大了（超过 128 KB）。作文本身不限制字数，正常一篇远远到不了这个量级，请检查是不是把别的内容一起粘进来了。",
         )
       : errorResponse("INVALID_INPUT", "请求体不是合法 JSON。");
   }
   const body = read.value;
 
-  // ④ 先验口令，再谈批改——没通过就别浪费模型额度
+  // ③ 验口令。没通过就别谈批改——更别浪费模型额度
   const verdict = verifyAccessCode(
     (body as { accessCode?: unknown } | null)?.accessCode,
   );
@@ -128,10 +142,20 @@ export async function POST(request: Request) {
 
     // 只有"口令错了"才记失败。缺配置是站长的锅，不该把调用方锁掉
     if (code === "INVALID_ACCESS_CODE") {
-      limiter.recordFailure(clientKey);
-      // 人为拖慢，抬高串行爆破的成本。代价是正常用户打错一次也要等这一下
-      if (limiter.failDelayMs > 0) {
-        await new Promise((r) => setTimeout(r, limiter.failDelayMs));
+      const failure = await gate.recordFailure(clientKey);
+      // 人为拖慢，抬高串行爆破的成本。代价是正常用户打错一次也要等这一下。
+      // 放在 recordFailure 之后：这一下延迟正好盖住数据库那次往返
+      if (gate.policy.failDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, gate.policy.failDelayMs));
+      }
+      // 这次失败刚好锁上的话，文案里直接说清楚还要等多久——否则用户只会看到
+      // "口令不正确"，再试一次才被告知被锁了
+      if (failure.lockRetryAfterMs > 0) {
+        return errorResponse(
+          "RATE_LIMITED",
+          `访问口令不正确，且连续输错次数过多，已锁定，请 ${humanizeWait(failure.lockRetryAfterMs)}后再试。`,
+          { "Retry-After": String(Math.ceil(failure.lockRetryAfterMs / 1000)) },
+        );
       }
     }
 
@@ -142,7 +166,17 @@ export async function POST(request: Request) {
         : "访问口令不正确。请检查后重试。",
     );
   }
-  limiter.recordSuccess(clientKey);
+
+  // ④ 配额判定，权威值来自这条写语句自己返回的计数（见文件头）。
+  //    顺带把失败计数清零——口令正确这件事一次生效
+  const used = await gate.recordSuccess(clientKey);
+  if (isOverLimit(gate.policy.reviewLimit, used.windowCount)) {
+    return errorResponse(
+      "RATE_LIMITED",
+      `批改请求太频繁了，请 ${humanizeWait(used.windowResetAfterMs)}后再试。`,
+      { "Retry-After": String(Math.ceil(used.windowResetAfterMs / 1000)) },
+    );
+  }
 
   const input = (body ?? {}) as ReviewRequest;
 
@@ -316,6 +350,11 @@ export async function GET() {
       // 没配口令时服务端会拒绝一切批改，输入页据此提前提示
       gated: hasAccessCode(),
       model: getModel(),
+      // 限流状态存在哪。给一个模式串而不是布尔：出问题时第一句要问的正是
+      // "它到底有没有真的用上数据库"，两个值比 true/false 多带一半信息。
+      // ⚠️ 它报的是**配置**（有没有 DATABASE_URL），不是"数据库此刻活着"——
+      // 运行期挂掉会降级到内存，这里看不出来，只有终端里那条告警会说话
+      persistence: persistenceMode(),
     },
     { headers: { "Cache-Control": "no-store" } },
   );
