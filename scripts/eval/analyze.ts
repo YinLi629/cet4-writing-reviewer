@@ -147,6 +147,10 @@ function main(): void {
   // ---------------------------------------------------------------- 结构
   head("④ 结构合规");
   let dimOk = 0, evOk = 0, planOk = 0, prioOk = 0, dimCovered = 0;
+  // 本轮改动的立论就是"example 在实际输出里经常缺席"，所以次数要**按条**统计
+  // 而不是按篇——按篇统计的话，一篇里 3 条建议只给了 1 个示范也算"这一篇有示范"，
+  // 提示词改动到底是把 40% 提到 90% 还是从 40% 提到 45%，就完全看不出来。
+  let exGiven = 0, exTotal = 0, exUnverified = 0, trainOk = 0;
   const structBad: string[] = [];
   for (const r of ok) {
     const res = R(r);
@@ -157,17 +161,30 @@ function main(): void {
     const covered = ["content", "language", "organization"].every((d) =>
       res.evidence.some((e) => e.dimension === d),
     );
+    // 旧存档没有这个键（lib/store.ts 是盲 as ReviewResult），`?? []` 不是多余的防御
+    const training = res.trainingPlan ?? [];
+    const trained = training.length > 0 && training.length <= 3;
+    const badEx = res.upgradePlan.filter((p) => p.exampleUnverified).length;
+    exTotal += res.upgradePlan.length;
+    exGiven += res.upgradePlan.filter((p) => p.example).length;
+    exUnverified += badEx;
+
     if (dims) dimOk++;
     if (ev) evOk++;
     if (plan) planOk++;
     if (prio) prioOk++;
     if (covered) dimCovered++;
+    if (trained) trainOk++;
     const problems = [
       !dims && "维度分不是 3 项",
       !ev && `证据 ${res.stats.evidenceCount} 条（要求 5-15）`,
       !plan && `升档建议 ${res.upgradePlan.length} 条（要求 3-5）`,
       !prio && "priority 不连续",
       !covered && "有维度没有证据",
+      // 训练区缺席**不算问题**（"这篇没有反复出现的毛病"是合法结论），
+      // 所以不列进 problems，只在下面看出现率
+      training.length > 3 && `训练项 ${training.length} 条（上限 3）`,
+      badEx > 0 && `有 ${badEx} 条示范没能在原文定位`,
     ].filter(Boolean);
     if (problems.length) structBad.push(`  ✗ ${r.id.padEnd(6)} ${problems.join("；")}`);
   }
@@ -176,6 +193,9 @@ function main(): void {
   console.log(`  升档建议 3-5 条： ${pct(planOk, ok.length)}`);
   console.log(`  priority 连续：   ${pct(prioOk, ok.length)}`);
   console.log(`  三维度都有证据：  ${pct(dimCovered, ok.length)}`);
+  console.log(`  升档示范覆盖率：  ${pct(exGiven, exTotal)}（${exGiven}/${exTotal} 条建议给了示范，越高越好）`);
+  console.log(`  示范未能定位：    ${exUnverified} 条${exUnverified > 0 ? "  ← 模型编了原文里没有的句子，要人看" : ""}`);
+  console.log(`  训练区出现率：    ${pct(trainOk, ok.length)}（缺席是合法的，不必强求 100%）`);
   if (structBad.length) console.log("\n" + structBad.join("\n"));
 
   // ---------------------------------------------------------------- 证据

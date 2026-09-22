@@ -28,6 +28,24 @@ export type LocateMethod =
   | "none"; // 没能在原文中定位
 
 /**
+ * 定位的**歧义**：匹配上了，但不确定是不是模型想指的那一处。
+ *
+ * 和 LocateMethod 是两个正交的维度，不能互相顶替：
+ * locateMethod 回答"**怎么**匹配上的"（逐字/归一化/模糊），
+ * 这一位回答"命中的**是不是那一处**"。
+ *
+ * 为什么必须单开一位：一条短引文（"he"、"I like sports"）在原文里出现两次时，
+ * 定位代码取走第一处、返回 method: "exact"，报告上带着"逐字命中原文"的徽章
+ * 高亮到**另一句**上——"抄错了"是会响亮失败的（verified: false），
+ * 这种是**装作成功**，用户没有任何线索。所以设计目标是让不确定变得可见，
+ * 而不是一律判失败。
+ *
+ * `multiple`：原文里有多处同样匹配，`hitCount` 是候选处数。
+ * `approximate`：模糊匹配（词重叠 ≥80%）命中的，落点本身只是近似。
+ */
+export type AmbiguityReason = "multiple" | "approximate";
+
+/**
  * 一条证据 = 一处原文 + 一句判断。
  *
  * start/end 不是模型给的，是服务端拿到 quote 后在原文里定位算出来的。
@@ -46,6 +64,21 @@ export interface Evidence {
   /** 该引用是否真的在原文中找到了 */
   verified: boolean;
   locateMethod: LocateMethod;
+  /**
+   * 定位带有不确定性时的原因；确定无疑时为 undefined。
+   * 渲染侧统一写成 `e.ambiguity ?? "none"`，别去判 undefined。
+   */
+  ambiguity?: AmbiguityReason;
+  /** 匹配上的候选处数（含被选中的那处）。只在 ambiguity 为 multiple 时有值 */
+  hitCount?: number;
+  /**
+   * `kind` 不是 strength/major/minor 三者之一，已按 minor 兜底。
+   *
+   * 为什么要留这个标记：`kind` 同时喂给展示（颜色）和判分（按 major 条数算的
+   * 分数上限），静默降级会让一次字段异常同时污染两边——本该压到 6 分的报告
+   * 照旧发出 11 分，而报告上看不出任何异常。见 lib/review.ts 的 coerceKind。
+   */
+  kindDegraded?: boolean;
   /** 这条证据说明了什么 */
   comment: string;
   /** 针对性的修改建议；strength 类通常为空 */
@@ -69,6 +102,13 @@ export interface PendingEvidence {
   id: string;
   dimension: Dimension;
   kind: EvidenceKind;
+  /**
+   * `kind` 是兜底来的。见 Evidence 上的同名字段。
+   *
+   * 和 start/verified 那几个不一样：它**不依赖整批引文**，解析这一条的时候就定了，
+   * 所以流式期间就该显示出来，不必等到最后。
+   */
+  kindDegraded?: boolean;
   quote: string;
   comment: string;
   suggestion?: string;
@@ -88,6 +128,25 @@ export interface UpgradeAction {
   rationale: string;
   /** 改写示范 */
   example?: { before: string; after: string };
+  /**
+   * 模型没给出**可用**的 example（压根没给，或给了但被 coerceExample 判为无效）。
+   *
+   * 为什么要标出来而不是静默留白：报告上"这里空着"和"模型没给"长得一模一样，
+   * 用户分不清是模型偷懒还是渲染坏了。标出来，提示词的失效才看得见。
+   * 注意它**不产生 warning**——没给示范是正常降级（纯 organization 的建议本就
+   * 落不到单句上），不是故障。见 lib/review.ts 的 assembleResult。
+   */
+  exampleMissing?: boolean;
+  /**
+   * example.before 没能在原文里定位到——模型很可能自己造了一句原文里没有的话。
+   *
+   * 这是把 example 从"模型说啥是啥"变成**可证伪**的关键：和证据坐标同一个哲学，
+   * 坐标不由模型给，由服务端拿 before 回原文里重新找，找不到就如实标出。
+   *
+   * 判定见 lib/review.ts 的 locateExampleQuote。**只认 exact / normalized，不认
+   * fuzzy**——理由写在那边的注释里，改判定之前务必读一下。
+   */
+  exampleUnverified?: boolean;
   /** 关联的证据条目，用于在报告里互相跳转 */
   linkedEvidenceIds: string[];
 }
@@ -107,6 +166,55 @@ export interface DimensionScore {
   /** 0-5，仅用于给用户看强弱分布 */
   score: number;
   comment: string;
+}
+
+/**
+ * 训练项的类别——**可训练的具体毛病**，不是评分维度。
+ *
+ * 为什么不复用 Dimension（content/language/organization）：那三个太粗。"语言"底下
+ * 混着拼写、时态、搭配、句式……它们的练法毫无共同之处，按维度给建议只能给出
+ * "多练语言"这种废话。按错误类型分，才能给出"拿不准的词换掉，别赌"这种能执行的动作。
+ *
+ * 出处的准确说法是**「锚定 + 扩展」**，别当成"从 rubric 倒推出来的"：
+ * - 直接对应 rubric 里 major 说法的 5 个：tense / agreement / sentence-structure /
+ *   noun-article / chinglish（措辞见 lib/prompt.ts 的 KIND_RULES）；
+ * - 对应 minor 说法的 3 个：spelling ≈ 个别笔误、capitalization ≈ 大小写疏漏、
+ *   collocation ≈ 单处搭配不当；
+ * - **rubric 里没有对应说法的 5 个**：word-choice / sentence-variety / cohesion /
+ *   paragraphing / task-response，是本轮新造的词。
+ *
+ * 保留后 5 个是因为"句式单一""没分段"高频且可训练，rubric 现有的 8 类覆盖不到。
+ * 代价是**改 rubric 措辞不会自动同步到这里**，两边术语会慢慢漂，改的时候回来对一眼。
+ *
+ * ⚠️ 增删取值要同步三处：本类型、lib/training.ts 的 TRAINING_PLAYBOOK、
+ * lib/labels.ts 的 TRAINING_FOCUS_LABEL。漏了查表会被 TypeScript 挡下
+ * （`Record<TrainingFocus, …>` 要求键齐全），漏了标签不会——那个有专门的断言兜。
+ */
+export type TrainingFocus =
+  | "spelling" | "capitalization"
+  | "tense" | "agreement" | "noun-article" | "sentence-structure"
+  | "chinglish" | "collocation" | "word-choice"
+  | "sentence-variety" | "cohesion" | "paragraphing" | "task-response";
+
+/**
+ * 一条训练项：**诊断由模型给，练法由服务端查表**（lib/training.ts 的 TRAINING_PLAYBOOK）。
+ *
+ * 为什么这么切：练法文案要可写断言、措辞统一、零幻觉，交给模型生成就三样都没有；
+ * 而"这篇最该练什么"非读过这篇作文不能知，只能由模型判断。各取所长。
+ */
+export interface TrainingItem {
+  focus: TrainingFocus;
+  /**
+   * 模型给的：为什么**这篇**要练它。必须引用本篇的具体现象
+   * （"全文 6 处第三人称单数漏 s"），不许写"中国学生普遍……"这类套话。
+   */
+  reason: string;
+  /**
+   * 关联的证据条目，用于在报告里跳回证据卡。
+   * 和 UpgradeAction.linkedEvidenceIds 一样是**服务端补的**，不要求模型给
+   * ——见 lib/review.ts 的 parseTrainingPlan。
+   */
+  linkedEvidenceIds: string[];
 }
 
 export interface ReviewResult {
@@ -131,6 +239,19 @@ export interface ReviewResult {
   evidence: Evidence[];
   /** 升档建议，已按 priority 升序 */
   upgradePlan: UpgradeAction[];
+  /**
+   * 训练区：按错误类型归类的「写作时怎么做 + 平时怎么练」，显示在报告结尾。
+   *
+   * **可选**，两个原因，都不是可选的：
+   * 1. 模型没给、或给的都被解析规则丢了时，这一节**整节不显示**——报告里留个空壳
+   *    比没有更糟。见 lib/review.ts 的 parseTrainingPlan。
+   * 2. 存储里的旧报告没有这个键（lib/store.ts 是盲 `as ReviewResult`），
+   *    渲染侧必须写 `?.`。
+   *
+   * ⚠️ 给 ReviewResult 加字段**一律要可选**：scripts/selftest.ts 里有内联的
+   * ReviewResult 字面量，加必填字段会让 typecheck 和 selftest 一起编不过。
+   */
+  trainingPlan?: TrainingItem[];
   stats: {
     wordCount: number;
     sentenceCount: number;
@@ -139,6 +260,15 @@ export interface ReviewResult {
     evidenceCount: number;
     /** 定位成功的证据条数 */
     verifiedCount: number;
+    /**
+     * 定位成功、但**带有歧义**的条数（ambiguity 非空）。
+     *
+     * 是 verifiedCount 的**子计数**，不是另一条分支——"已定位/未定位"的二分
+     * 不被打破，报告里那句"5/6 条已定位"照旧成立。单开一个数是因为这两件事
+     * 的严重程度完全不同："没定位到"是响亮失败，"定位了但可能不是那一处"
+     * 是安静的错误，后者才是用户完全看不出来的那种。
+     */
+    ambiguousCount?: number;
   };
   /**
    * 报告可信度的提示。例如引用没能定位、证据条数偏少、模型漏返字段。
@@ -270,7 +400,7 @@ export type ReviewStreamEvent =
 /**
  * 客户端在等待期间积累的部分结果。
  *
- * 它**用完就丢**：批改完成后照旧写 sessionStorage 再跳 /result，权威报告在那边。
+ * 它**用完就丢**：批改完成后照旧写 localStorage 再跳 /result，权威报告在那边。
  * 因此它不需要和 ReviewResult 对账，也就没有"部分结果与最终结果不一致"这类问题。
  * 绝不能落盘，也绝不能传给 ResultActions / buildReportHtml。
  */

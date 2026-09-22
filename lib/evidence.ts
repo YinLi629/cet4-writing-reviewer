@@ -9,9 +9,14 @@
  *     而不是画一个看起来精确、实际错位的下划线。
  *  3. 定位方法（exact / normalized / fragmented / fuzzy）会一并返回，
  *     用户能知道这条引用有多可信。
+ *
+ * 第 2 条说的是"找不到就是失败"，但还有一种更隐蔽的情况：**找到了，却可能找错了**
+ * ——短引文在原文里出现两次时，逐字命中是毫无疑问的，命中的是不是模型想指的那一处
+ * 却不是。这种"装作成功"没有任何线索，所以额外给出 ambiguity（见 LocateResult）。
+ * 两种情况的处理方向一致：如实说出来，而不是替用户猜。
  */
 
-import type { Evidence, LocateMethod } from "./types";
+import type { AmbiguityReason, Evidence, LocateMethod } from "./types";
 
 export interface LocateResult {
   start: number | null;
@@ -19,6 +24,10 @@ export interface LocateResult {
   method: LocateMethod;
   /** 实际命中的原文片段，便于对照模型抄得准不准 */
   matched: string | null;
+  /** 匹配上的候选处数（含被选中的这处）。只在 ambiguity 为 multiple 时有值 */
+  hitCount?: number;
+  /** 定位的歧义程度。见 lib/types.ts 的 AmbiguityReason */
+  ambiguity?: AmbiguityReason;
 }
 
 const NOT_FOUND: LocateResult = {
@@ -27,6 +36,38 @@ const NOT_FOUND: LocateResult = {
   method: "none",
   matched: null,
 };
+
+/**
+ * 命中多处时的歧义标记，命中唯一时返回空对象（拼进结果里什么也不加）。
+ *
+ * 刻意**不降级 method**：method 说的是"怎么匹配上的"，而那几处出现的确都是
+ * 逐字命中，这一点没有疑问。把其中一条改标成 normalized/fuzzy 是假信息——
+ * 它明明是逐字的。歧义单开一个字段：让不确定可见，而不是把两条都判成失败，
+ * 也不是假装没这回事。
+ */
+function ambiguityOf(hitCount: number): Pick<LocateResult, "hitCount" | "ambiguity"> {
+  return hitCount > 1 ? { hitCount, ambiguity: "multiple" } : {};
+}
+
+/**
+ * 把若干区间按重叠合并，返回互不重叠的区间的个数。
+ *
+ * 只用来数"有几处"，所以不需要保留边界，返回个数就够了。
+ * 为什么要合并：模糊匹配会用 n-1/n/n+1 三种窗口长度各扫一遍，
+ * 同一处命中会产生两三个相互重叠的窗口，直接数窗口会把一次命中数成三四次。
+ */
+function countRegions(spans: Array<[number, number]>): number {
+  if (spans.length === 0) return 0;
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  let regions = 1;
+  let reach = sorted[0][1];
+  for (let i = 1; i < sorted.length; i++) {
+    // 相接（start === reach）也算同一处：那是同一个窗口被长度 ±1 切出来的
+    if (sorted[i][0] > reach) regions += 1;
+    reach = Math.max(reach, sorted[i][1]);
+  }
+  return regions;
+}
 
 /** 排版变体归一：弯引号、破折号、不间断空格等 */
 const SMART_MAP: Record<string, string> = {
@@ -222,6 +263,9 @@ function locateSingle(
       end: at + quote.length,
       method: "exact",
       matched: essay.slice(at, at + quote.length),
+      // 原文里逐字出现两次以上时，"模型指的是哪一处"是引文本身回答不了的。
+      // 取第一处未占用的那个只是当下最合理的猜测，报告里必须说清这是猜测
+      ...ambiguityOf(exactHits.length),
     };
   }
 
@@ -241,7 +285,13 @@ function locateSingle(
 
     if (mapped.length > 0) {
       const [start, end] = mapped.find(([s, e]) => !overlaps(s, e, claimed)) ?? mapped[0];
-      return { start, end, method: "normalized", matched: essay.slice(start, end) };
+      return {
+        start,
+        end,
+        method: "normalized",
+        matched: essay.slice(start, end),
+        ...ambiguityOf(mapped.length),
+      };
     }
   }
 
@@ -269,6 +319,12 @@ function fuzzyLocate(
 
   const n = qTokens.length;
   let best: { score: number; start: number; end: number } | null = null;
+  /**
+   * 所有达到阈值的窗口，**不剔除与已占用区间重叠的**。
+   * 数"有几处差不多匹配"不能取决于别的证据先占了哪里，否则同一批引文的
+   * 数量统计会随排序漂移。
+   */
+  const passing: Array<[number, number]> = [];
 
   // 窗口长度允许上下浮动 1 个词
   for (const w of [n - 1, n, n + 1]) {
@@ -292,6 +348,7 @@ function fuzzyLocate(
 
       const start = eTokens[i].start;
       const end = eTokens[i + w - 1].end;
+      passing.push([start, end]);
       if (overlaps(start, end, claimed)) continue;
 
       if (!best || score > best.score) best = { score, start, end };
@@ -299,11 +356,19 @@ function fuzzyLocate(
   }
 
   if (!best) return null;
+
+  // 模糊匹配的落点本身就只是近似，但"近似"和"有多处差不多近似"是两件事：
+  // 前者已经由 method: "fuzzy" 说清楚了（徽章上写着"模糊命中"），
+  // 再挂一句"不确定"是重复的噪音。真正新增的信息是**它本来可以落在别处**——
+  // 一条 5 词引文只要 4 词相同就算命中，原文里另一句凑巧也满足时，
+  // 模型指的是哪一句代码无从判断。所以这里也只在多于一处时才标记。
+  const regions = countRegions(passing);
   return {
     start: best.start,
     end: best.end,
     method: "fuzzy",
     matched: essay.slice(best.start, best.end),
+    ...ambiguityOf(regions),
   };
 }
 
@@ -353,6 +418,9 @@ export function attachLocations(
       end: hit.end,
       verified: hit.method !== "none",
       locateMethod: hit.method,
+      // 歧义只在"定位成功"时才带出来。没定位上的条目已经有 verified: false
+      // 这条更响亮的信息了，再挂一句"有多处候选"反而自相矛盾
+      ...(hit.ambiguity ? { ambiguity: hit.ambiguity, hitCount: hit.hitCount } : {}),
     };
   });
 }

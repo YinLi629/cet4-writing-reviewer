@@ -13,7 +13,7 @@
  * - `withPeriodicSweep` —— 每约 1000 次早拒顺手清一次陈旧行（无服务器环境没有
  *   后台任务，清理只能搭在流量上）
  *
- * ⚠️ 别和 lib/store.ts 搞混：那个是**浏览器**侧的 sessionStorage 读写（存结果页数据），
+ * ⚠️ 别和 lib/store.ts 搞混：那个是**浏览器**侧的 localStorage 读写（结果 / 草稿 / 口令），
  * 这个在服务端。名字像纯属巧合。
  *
  * ## 降级为什么不是"放行"
@@ -387,6 +387,16 @@ export function withFallback(
       } catch (err) {
         reportDbProblem(err);
       }
+      // fallback 也要扫，而且**不能只在 primary 失败时才扫**。
+      //
+      // 这里原来只有 primary.sweep()，于是降级期间写进内存 Map 的那些条目
+      // 永远没人清：DB 挂着的时候来一波伪造 IP 的洪泛，Map 就是一个假 IP 一条，
+      // 只增不减。DB 恢复之后更糟——那时 primary 每次都成功，catch 分支再也进不去，
+      // 长驻进程（next start 自托管，不像 serverless 会随实例回收）里这些条目
+      // 会一直留到进程重启为止。
+      //
+      // 内存实现不抛异常，所以直接调；primary 是否失败与此无关。
+      await fallback.sweep();
     },
   };
 }
@@ -423,7 +433,11 @@ export function getGate(policy: RateLimitPolicy = configFromEnv()): RateLimitGat
     }
   }
 
-  // 清理包在最外层：降级到内存实现时同样需要它（那个 Map 也会长）
+  // 清理包在最外层，为的是**没有 DATABASE_URL** 那条分支：那时 gate 就是内存
+  // 实现，除了这里没人会去扫它。配了 DATABASE_URL 时，那个内存 Map 是
+  // withFallback 的 fallback，由 withFallback.sweep() 负责扫。
+  // 两层各管各的，不重不漏——曾经这里被读成"外层扫一次就覆盖了两种情况"，
+  // 结果 fallback 的 Map 谁也没扫（见 withFallback.sweep 的注释）。
   gate = withPeriodicSweep(gate);
 
   cachedGate = { key: cacheKey, gate };

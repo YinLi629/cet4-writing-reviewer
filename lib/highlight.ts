@@ -18,6 +18,14 @@ export interface Segment {
   ids: string[];
 }
 
+/**
+ * 原文里的高亮块和证据卡片，是同一组跳转的两端。前缀必须**两端一致、
+ * 且网页和导出的 HTML 也一致**——否则链接会在某一端指向不存在的元素，
+ * 表现是"点了没反应"，不报错，极难发现。
+ */
+export const ANCHOR_PREFIX = "anchor-";
+export const CARD_PREFIX = "card-";
+
 function severity(kind: EvidenceKind): number {
   if (kind === "major") return 3;
   if (kind === "minor") return 2;
@@ -98,4 +106,32 @@ export function segmentEssay(essay: string, evidence: Evidence[]): Segment[] {
   }
 
   return segments;
+}
+
+/**
+ * 证据 id → 它在原文里对应的**锚点元素 id**。
+ *
+ * 为什么需要这张表，而不是让每张证据卡片自己拼 `anchor-${e.id}`：
+ * 重叠的证据会被合并进**同一个** `<mark>`（见上面 segmentEssay 的合并逻辑），
+ * 而一个元素只能有一个 id——那个 id 用的是合并块里的第一条证据。于是：
+ *
+ *   证据 e1 和 e3 重叠 → 只画出 `<mark id="anchor-e1">`
+ *   → e3 的卡片拼出 `#anchor-e3` → 指向不存在的元素 → **点了没反应，也不报错**
+ *
+ * 所以"某条证据该跳到哪"必须问这张表，不能自己拼。
+ *
+ * 直接复用 segmentEssay 的结果而不是另写一遍合并逻辑：这样映射和真正渲染出来的
+ * `<mark>` 一定一致。两处各写一份的话，改了一处忘了另一处，就会重新长出上面那种
+ * 死链接，而且只在"证据恰好重叠"时才复现。
+ *
+ * 没定位到原文（或区间越界）的证据不在表里——它们本来就没有高亮可跳。
+ */
+export function anchorMap(essay: string, evidence: Evidence[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const seg of segmentEssay(essay, evidence)) {
+    if (!seg.kind || seg.ids.length === 0) continue;
+    const anchor = `${ANCHOR_PREFIX}${seg.ids[0]}`;
+    for (const id of seg.ids) map.set(id, anchor);
+  }
+  return map;
 }

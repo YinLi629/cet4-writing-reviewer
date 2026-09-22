@@ -22,6 +22,9 @@
  * 4. **锁过期不清零**，计数从 7 继续涨到 8。
  * 5. **第 100 次放行、第 101 次 429**（`isOverLimit` 用的是 `>` 不是 `>=`）。
  * 6. **400 也消耗配额**——这条是已知副作用，写进 README 了，这里钉着。
+ * 7. **口令页（`/api/access`）和批改走的是同一条防爆破路径**：错口令一样记失败、
+ *    一样按档位上锁（所以它不是绕过锁定的旁路），但**不占**那 100 次批改额度、
+ *    也不清零失败计数（所以它也不是绕过配额的旁路）。这三条只能打真实 HTTP 才看得见。
  *
  * ## 怎么做到"不真调模型"
  *
@@ -52,6 +55,13 @@ loadDotEnvLocal();
 
 const BASE = process.env.WALKTHROUGH_BASE ?? "http://localhost:3000/api/review";
 
+/**
+ * 口令页那条路由。[8] 用它验"口令页不是绕过锁定/配额的旁路"。
+ * 从 BASE 推出来是为了让 `WALKTHROUGH_BASE` 一改就跟着走；只有 BASE 不以
+ * `/review` 结尾时它才退化成 BASE 本身（那时这几条断言会红，正好提醒改这里）。
+ */
+const ACCESS_BASE = BASE.replace(/\/review$/, "/access");
+
 /** 本机回环的 client_key。见文件头"为什么是本机专用" */
 const KEY = "::1";
 
@@ -78,8 +88,8 @@ interface Reply {
   body: { error?: string; code?: string } | null;
 }
 
-async function post(payload: Record<string, unknown>): Promise<Reply> {
-  const res = await fetch(BASE, {
+async function postTo(url: string, payload: Record<string, unknown>): Promise<Reply> {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
@@ -92,6 +102,20 @@ async function post(payload: Record<string, unknown>): Promise<Reply> {
   }
   return { status: res.status, retryAfter: res.headers.get("retry-after"), body };
 }
+
+const post = (payload: Record<string, unknown>) => postTo(BASE, payload);
+
+/**
+ * 口令页的 POST。**没有 essay 字段**——这条路由根本不看作文，这正是它能
+ * "免费验口令"的原因，也是[8]要钉住的东西。
+ */
+const postAccess = (accessCode: string) => postTo(ACCESS_BASE, { accessCode });
+
+/**
+ * 口令。`?? ""` 是给类型检查看的：`main()` 里已经挡掉了"没配口令"的情况，
+ * 走不到这儿（真走到这儿，空口令也只会拿到 401，不会假装通过）。
+ */
+const THE_CODE = CODE ?? "";
 
 const wrong = (n: number) => post({ accessCode: `deliberately-wrong-${n}`, essay: SHORT_ESSAY });
 const right = () => post({ accessCode: CODE, essay: SHORT_ESSAY });
@@ -174,6 +198,11 @@ async function run(): Promise<void> {
 
   // ---- 2. 第 7 次：锁 1 分钟 --------------------------------------------
   console.log(`\n[2] 第 ${FAIL_TIER1_COUNT} 次失败`);
+  // 记下发起这一刻的时间。下面那条"到期时间约在 N 秒后"必须拿它当基准，
+  // 而不是断言时的 Date.now()——后者把"这次请求 + 一次 row() 查询 + 断言之间
+  // 耗掉的时间"也算进去了，本机第一次连库偏慢时会假红（实测过一次：
+  // 26 项里唯一的一条红，重跑就绿）。基准取发请求前，误差就只剩请求本身
+  const atSeventhFailure = Date.now();
   const seventh = await wrong(FAIL_TIER1_COUNT);
   // "这一次失败刚好把人锁上"时路由返回 429 而不是 401（route.ts 的注释：否则用户
   // 只看到"口令不正确"，再试一次才被告知被锁）。文案因此和配额的 429 不同。
@@ -194,12 +223,17 @@ async function run(): Promise<void> {
   );
   cur = await row();
   check("库里记下了起算点（封顶从这一刻算）", cur?.lock_started_at !== null, cur?.lock_started_at);
+  // 基准是"发请求前那一刻"，所以这里的容差只需要覆盖这一次请求自己的耗时
+  // （HTTP + 库里的 now() + 人工失败延迟），5 秒很宽松了。
+  // 这条断言真正要抓的错是"锁写成了别的档位"（1 分钟 vs 5 分钟）或"没写"，
+  // 都远不止 5 秒的偏差
+  const lockRemainingMs = cur?.locked_until
+    ? cur.locked_until.getTime() - atSeventhFailure
+    : Number.NaN;
   check(
     `锁定到期时间约在 ${FAIL_TIER1_LOCK_SECS} 秒后`,
-    cur?.locked_until !== null &&
-      cur?.locked_until !== undefined &&
-      Math.abs(cur.locked_until.getTime() - Date.now() - FAIL_TIER1_LOCK_SECS * 1000) < 3000,
-    cur?.locked_until,
+    Math.abs(lockRemainingMs - FAIL_TIER1_LOCK_SECS * 1000) < 5000,
+    { locked_until: cur?.locked_until, 距发起: `${Math.round(lockRemainingMs / 1000)} 秒` },
   );
 
   // ---- 3. 锁定期内：硬锁，口令正确也进不去 ------------------------------
@@ -329,6 +363,61 @@ async function run(): Promise<void> {
     { window_count: cur?.window_count },
   );
 
+  // ---- 8. 口令页：同一条防爆破路径，但不占额度 ---------------------------
+  // 这一段的每一条都是"走偏了就会让口令页变成旁路"的地方：
+  // 不记失败 / 不清零失败 → 它成了绕过锁定的旁路；记了额度 → 它成了绕过配额的旁路。
+  console.log("\n[8] 口令页的校验接口");
+  await seedCounts(0, 0);
+  const gateBefore = await row();
+
+  const gateWrong = await postAccess("deliberately-wrong-gate");
+  check(
+    "错口令 → 401 INVALID_ACCESS_CODE（和批改页同一个码）",
+    gateWrong.status === 401 && gateWrong.body?.code === "INVALID_ACCESS_CODE",
+    { status: gateWrong.status, code: gateWrong.body?.code },
+  );
+  cur = await row();
+  check(
+    "失败是**记下来的**（口令页不是防爆破的缺口）",
+    cur?.fail_count === 1,
+    { fail_count: cur?.fail_count },
+  );
+
+  const gateOk = await postAccess(THE_CODE);
+  check("口令正确 → 200", gateOk.status === 200, { status: gateOk.status });
+  cur = await row();
+  // 这条是本段的重点：它钉住 lib/access-gate.ts 头注释里那句"不做配额早拒"
+  check(
+    "**不占批改额度**：window_count 一动不动（验口令不该花站长的钱）",
+    cur?.window_count === (gateBefore?.window_count ?? 0),
+    { before: gateBefore?.window_count, after: cur?.window_count },
+  );
+  check(
+    "也**不清零**失败计数（刻意的取舍，见那条路由的头注释）",
+    cur?.fail_count === 1,
+    { fail_count: cur?.fail_count },
+  );
+
+  // 锁定档位在口令页同样生效——否则爆破的人从这里进就绕开了 [2]/[3] 验过的锁
+  await seedCounts(FAIL_TIER1_COUNT - 1, 0);
+  const gateSeventh = await postAccess("deliberately-wrong-gate-7");
+  check(
+    `第 ${FAIL_TIER1_COUNT} 次错口令在口令页同样锁上（429，不是 401）`,
+    gateSeventh.status === 429 && gateSeventh.body?.code === "RATE_LIMITED",
+    { status: gateSeventh.status, code: gateSeventh.body?.code },
+  );
+  const gateLocked = await postAccess(THE_CODE);
+  check(
+    "【硬锁】锁定期内口令**正确**也进不去（同一条锁）",
+    gateLocked.status === 429,
+    { status: gateLocked.status },
+  );
+  check(
+    "锁定时同样带 Retry-After",
+    nearSecs(gateLocked.retryAfter, FAIL_TIER1_LOCK_SECS),
+    { retryAfter: gateLocked.retryAfter },
+  );
+
   // ---- 收尾 --------------------------------------------------------------
   await clean();
   const left = await dbQuery(`SELECT count(*)::int AS n FROM rate_limits`, []);
@@ -338,6 +427,39 @@ async function run(): Promise<void> {
   console.log(`通过 ${passed} 项，失败 ${failed} 项`);
   console.log("=".repeat(46));
   if (failed > 0) process.exitCode = 1;
+}
+
+/**
+ * 先把数据库焐热，再开始断言。
+ *
+ * ⚠️ 冷启动的 Neon 连接第一次用要建连，实测能越过 lib/db.ts 那个 4 秒超时。撞上的
+ * 那一次请求会被判成"数据库不可用"而**降级到内存实现**——限流那一刻是真的漏了，
+ * 而脚本这边看到的是一串莫名其妙的红：第 7 次失败没锁上、库里的计数停在 6、
+ * 锁定期穿透失败……全都指向"策略坏了"，实际只是那一次查询慢了。踩过两次，
+ * 两次都是**刚重启 dev server 之后的第一轮**。
+ *
+ * 只预热、不掩盖：真降级了照样会红——下面每一轮都读库核对，内存里记的账对不上。
+ * 需要快速往返（而不是"能连上就行"），因为临界的是超时那条线：日志里第一次
+ * POST 用了 3.7 秒，离 4 秒只差一点。
+ */
+async function warmUpDb(): Promise<void> {
+  for (let i = 0; i < 15; i += 1) {
+    const startedAt = Date.now();
+    try {
+      await dbQuery(`SELECT 1`, []);
+      // 1 秒是个保守的门槛：真请求还要再读写一次，留出余量
+      if (Date.now() - startedAt < 1000) {
+        if (i > 0) console.log(`（数据库预热了 ${i + 1} 次才快起来）`);
+        return;
+      }
+    } catch {
+      // 连不上也继续试；真的连不上，下面每一轮都会红，不用在这儿报
+    }
+    await sleep(1000);
+  }
+  // 预热到这一步还是慢的，说明不是冷启动。继续跑，但先给一句解释，
+  // 免得下面那些红看起来像策略坏了
+  console.log("⚠️ 数据库预热 15 次都没有快到 1 秒内，下面可能出现假红（真降级也会这样）。\n");
 }
 
 async function main(): Promise<void> {
@@ -358,6 +480,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  await warmUpDb();
   await run();
 }
 

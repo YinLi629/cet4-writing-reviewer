@@ -1,6 +1,6 @@
 "use client";
 
-import { segmentEssay } from "@/lib/highlight";
+import { ANCHOR_PREFIX, segmentEssay } from "@/lib/highlight";
 import { KIND_LABEL } from "@/lib/labels";
 import type { Evidence } from "@/lib/types";
 
@@ -10,7 +10,9 @@ import type { Evidence } from "@/lib/types";
  * 用的是和服务端 HTML 报告完全相同的 segmentEssay（lib/highlight.ts），
  * 所以网页上和下载的报告里高亮位置一定一致。
  *
- * 点高亮跳到对应证据卡片；点证据卡片上的「原文」链接则跳回这里。
+ * 两个方向都能跳：点高亮跳到对应证据卡片（下面的 jumpToCard），
+ * 点证据卡片上的「原文第 X–Y 字符」则跳回这里（EvidenceList 里的 <a href="#…">，
+ * 目标就是这个组件渲染的 `anchor-` id）。
  */
 export function HighlightedEssay({
   essay,
@@ -55,7 +57,7 @@ export function HighlightedEssay({
             <mark
               key={i}
               className={`ev ev-${seg.kind}`}
-              id={`anchor-${primaryId}`}
+              id={`${ANCHOR_PREFIX}${primaryId}`}
               title={`对应证据 ${seg.ids.join("、")}${extra} —— 点击查看`}
               role="button"
               tabIndex={0}

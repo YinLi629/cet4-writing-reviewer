@@ -23,7 +23,9 @@ import {
   TIER_GAP,
   tierGapFor,
 } from "./rubric";
+import { TRAINING_FOCUS_LABEL } from "./labels";
 import type { TextStats } from "./text-stats";
+import { TRAINING_FOCUSES } from "./training";
 import { DIMENSIONS } from "./types";
 
 /** 证据条数下限。太少说明模型没认真读，会触发重试。 */
@@ -75,9 +77,15 @@ const JSON_CONTRACT = `{
       "action": "具体要做什么，中文，一句话，必须可执行。不要写“多练习”“注意语法”这类无法落地的建议。",
       "rationale": "为什么这样做能升档——要对应到档次描述里的具体差距",
       "example": {
-        "before": "原文中的写法（尽量逐字来自原文）",
-        "after": "改写后的写法"
+        "before": "原文中的写法。**必须逐字复制自原文**，规则同 quote",
+        "after": "改写后的写法。只改 before 指出的那一处，不要整句重写"
       }
+    }
+  ],
+  "trainingPlan": [
+    {
+      "focus": "错误类别，只能从下面给出的固定取值里选，原样使用英文单词",
+      "reason": "为什么【这篇】该练它。必须引用本篇的具体现象，中文 1-2 句"
     }
   ]
 }`;
@@ -91,6 +99,50 @@ const QUOTE_RULES = `【关于 quote 的硬性要求——违反会导致证据�
 5. 如果确实需要跳过中间内容，只能用省略号 "..." 连接两段**各自逐字**的片段，
    系统会分段定位。不要在省略号两侧夹杂自己的改写。
 6. 不要引用学生作文里不存在的句子。宁可少给一条证据，也不要编造。`;
+
+const EXAMPLE_RULES = `【关于 upgradePlan.example 的硬性要求】
+example 是整份报告里唯一"手把手告诉学生怎么改"的地方，所以它必须真的能照着改。
+原来的写法是可选的，结果模型经常直接省掉，学生看完只知道"要改语言"却不知道改哪句。
+
+1. 每条升档建议**都必须给 example**。唯一例外：纯 organization、落不到某一个句子上的
+   建议（例如"全文未分段"）。这种情况可以不给 example，但 action 里必须写清楚操作
+   （"把第 2 段之后另起一段"）。
+2. before **必须逐字来自学生原文**，规则和 quote 完全一样（见上）：不许改写、不许纠正
+   拼写、不许补全省略。系统会拿你给的 before 回原文里找，**找不到就在报告里标成
+   "未能在原文中定位"**——那比老老实实不给更糟，等于给了一份错的示范。
+3. after 是改写后的版本，**只改 before 指出的那一个问题**。不要把整句重写一遍
+   ——学生要能一眼看出是哪一处改动带来了提升，整句换掉就看不出因果了。
+4. after 不能和 before 一模一样，相同的示范等于没给。
+5. action 要写成"把 X 改成 Y"这种可执行的动作。禁止"多练习""注意语法""加强积累"。`;
+
+/**
+ * 训练区的规则。
+ *
+ * 合法取值必须**显式列出**：受控枚举不写清楚，模型一定会自创类别
+ * （写 "grammar"、"vocabulary" 这种它觉得合理的词），而解析侧对未知 focus
+ * 是**整条丢弃**的——于是模型以为自己给了建议，报告上却什么都不显示。
+ */
+const TRAINING_RULES = `【关于 trainingPlan 的硬性要求】
+这份报告最后要给一段训练建议。你**不写练法**，只做诊断：从下面的固定列表里挑出
+1-3 项**这篇作文最该练的**，按重要性排序，并说明为什么。具体怎么练由系统配文。
+
+宁可按重要性只给 1 项，也不要凑数——训练区回答的是"接下来重点练什么"，
+不是错误清单（错误清单在 evidence 里已经给过了）。只犯过一次、不具代表性的毛病不要放进来。
+
+合法取值（**必须原样使用这些英文单词**，不要自己造类别、不要翻译成中文）：
+${TRAINING_FOCUSES.map((f) => `- ${f}（${TRAINING_FOCUS_LABEL[f]}）`).join("\n")}
+
+最容易归错的一处是拼写和语法，必须分清楚：
+- spelling 只管"这个词本身写错了 / 同一个词前后拼法不一致"（enviroment、goverment、sucess、dont）。
+- noun-article 只管冠词与可数名词的**用法**（a activity 该用 an、many thing 该用 things、
+  不可数名词不能加 s）。
+不要把拼写错误当成 noun-article 的证据。一个词拼错和冠词用没用对是两回事，混在一起，
+学生照着练的是他其实没犯的那个毛病——训练区一共只有 1-3 项，归错一项就废掉一项。
+
+- reason 必须引用**这篇作文的具体现象**（例如"全文 6 处第三人称单数漏 s"），
+  禁止写"中国学生普遍……""这是常见错误"这类换个学生也成立的话。
+- 同一个 focus 只能出现一次。
+- 如果这篇作文确实没有反复出现的毛病，返回空数组 []，不要硬凑。`;
 
 const KIND_RULES = `【关于 kind 的判定】
 - strength：${EVIDENCE_KIND_GUIDE.strength}
@@ -203,6 +255,8 @@ ${DIMENSIONS.map((d) => `- ${DIMENSION_GUIDE[d]}`).join("\n")}
 
 ${QUOTE_RULES}
 
+${EXAMPLE_RULES}
+
 ${KIND_RULES}
 
 ${ORGANIZATION_EVIDENCE_RULES}
@@ -225,7 +279,10 @@ ${CEILING_RULE_TABLE.map((s) => `- ${s}`).join("\n")}
 
 【升档建议】
 给 3-5 条，按 priority 从 1 开始递增排序。每条都必须是这篇作文**具体可执行**的动作，
-并配一个 before/after 改写示范。禁止出现"多背单词""多练习写作"这类放之四海而皆准的废话。
+并配一个 before/after 改写示范（要求见上面 EXAMPLE_RULES，**必给**）。
+禁止出现"多背单词""多练习写作"这类放之四海而皆准的废话。
+
+${TRAINING_RULES}
 
 【输出格式】
 只输出一个 JSON 对象，不要输出任何解释文字，不要用 Markdown 代码块包裹。结构如下：

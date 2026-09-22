@@ -51,6 +51,13 @@ export function BandCard({ result }: { result: ReviewResult }) {
               </b>{" "}
               条证据已定位
             </span>
+            {/* 子计数，不是另一条分支：已定位/未定位的二分不变。只在真有歧义时
+                才出现——常显一个永远是 0 的项，用户会以为这项坏掉了 */}
+            {(stats.ambiguousCount ?? 0) > 0 && (
+              <span title="定位成功、但原文里有不止一处相近匹配">
+                <b>{stats.ambiguousCount}</b> 条位置有歧义
+              </span>
+            )}
           </div>
         </div>
       </div>

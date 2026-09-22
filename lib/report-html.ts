@@ -9,9 +9,16 @@
  * 学生作文里出现一个 `<script>` 就能让生成的报告变成 XSS 载体。
  */
 
-import { segmentEssay } from "./highlight";
-import { KIND_LABEL, METHOD_LABEL } from "./labels";
-import type { Evidence, ReviewResult } from "./types";
+import { ANCHOR_PREFIX, anchorMap, CARD_PREFIX, segmentEssay } from "./highlight";
+import {
+  AMBIGUITY_LABEL,
+  KIND_DEGRADED_HINT,
+  KIND_LABEL,
+  METHOD_LABEL,
+  TRAINING_FOCUS_LABEL,
+} from "./labels";
+import { TRAINING_PLAYBOOK } from "./training";
+import type { Evidence, ReviewResult, TrainingItem } from "./types";
 import { DIMENSION_LABEL } from "./types";
 
 export function escapeHtml(input: string): string {
@@ -33,6 +40,11 @@ export function escapeHtml(input: string): string {
  *
  * 注意顺序：**先按字符区间切段，再逐段转义**。绝不能先把整篇转义再插标签——
  * 转义会改变字符长度（`<` 变成 `&lt;`），之后所有的偏移量全部错位。
+ *
+ * 每个 `<mark>` 里裹着一个指向证据卡片的链接。**报告是零 JS 的**，所以来回两个
+ * 方向都只能靠朴素的 `#锚点`：浏览器原生就会跳，跳过去的高亮块由 CSS 的
+ * `:target` 自己亮起来。同理，这里也不能用 onclick——那会让整份报告在
+ * 禁用脚本的环境（邮件客户端、PDF 导出、某些预览器）里失去全部交互。
  */
 export function renderHighlightedEssay(essay: string, evidence: Evidence[]): string {
   const segments = segmentEssay(essay, evidence);
@@ -40,27 +52,55 @@ export function renderHighlightedEssay(essay: string, evidence: Evidence[]): str
   return segments
     .map((seg) => {
       const safe = escapeHtml(seg.text);
-      if (!seg.kind) return safe;
+      if (!seg.kind || seg.ids.length === 0) return safe;
+      // 合并块里只认第一条证据当锚点，和 anchorMap 保持一致
+      const primary = escapeHtml(seg.ids[0]);
       return (
-        `<mark class="ev ev-${seg.kind}" id="anchor-${escapeHtml(seg.ids[0])}" ` +
-        `data-ids="${escapeHtml(seg.ids.join(" "))}">${safe}</mark>`
+        `<mark class="ev ev-${seg.kind}" id="${ANCHOR_PREFIX}${primary}" ` +
+        `data-ids="${escapeHtml(seg.ids.join(" "))}">` +
+        `<a class="ev-link" href="#${CARD_PREFIX}${primary}">${safe}</a>` +
+        `</mark>`
       );
     })
     .join("");
 }
 
-function evidenceCard(e: Evidence): string {
+/**
+ * 一张证据卡片。
+ *
+ * `anchors` 是「证据 id → 原文锚点元素 id」的映射（lib/highlight.ts 的 anchorMap）。
+ * 必须查表而不是自己拼 `anchor-${e.id}`：重叠的证据会被合并进同一个 `<mark>`，
+ * 只有其中第一条能当上 id，其余的自己拼就会指向不存在的元素。
+ */
+function evidenceCard(e: Evidence, anchors: Map<string, string>): string {
   const locatable = e.start !== null && e.end !== null;
+  const anchor = anchors.get(e.id);
+  const method = escapeHtml(METHOD_LABEL[e.locateMethod]);
+
+  // 歧义徽章。**必须和定位方式并列出现**，不能被它顶替：徽章上写着"逐字命中原文"
+  // 的同时还挂着"多处匹配"，才是这份引文真实的可信度。只在有歧义时才渲染
+  const amb = e.ambiguity ? AMBIGUITY_LABEL[e.ambiguity] : null;
+  const ambChip = amb
+    ? `<span class="amb" title="${escapeHtml(amb.full)}">${amb.short}${
+        e.hitCount && e.hitCount > 1 ? `（${e.hitCount} 处）` : ""
+      }</span>`
+    : "";
+
   return `
-  <div class="card ev-card ev-card-${e.kind}" id="card-${escapeHtml(e.id)}">
+  <div class="card ev-card ev-card-${e.kind}" id="${CARD_PREFIX}${escapeHtml(e.id)}">
     <div class="ev-head">
-      <span class="badge badge-${e.kind}">${KIND_LABEL[e.kind]}</span>
+      <span class="badge badge-${e.kind}"${
+        e.kindDegraded ? ` title="${escapeHtml(KIND_DEGRADED_HINT)}" data-degraded="1"` : ""
+      }>${KIND_LABEL[e.kind]}</span>
       <span class="dim">${escapeHtml(DIMENSION_LABEL[e.dimension])}</span>
       ${
-        locatable
-          ? `<span class="loc" title="${escapeHtml(METHOD_LABEL[e.locateMethod])}">原文第 ${e.start}–${e.end} 字符</span>`
-          : `<span class="loc loc-bad">${escapeHtml(METHOD_LABEL[e.locateMethod])}</span>`
+        locatable && anchor
+          ? `<a class="loc loc-link" href="#${anchor}" title="${method} —— 点击跳到原文的这一处">原文第 ${e.start}–${e.end} 字符</a>`
+          : locatable
+            ? `<span class="loc" title="${method}">原文第 ${e.start}–${e.end} 字符</span>`
+            : `<span class="loc loc-bad">${method}</span>`
       }
+      ${ambChip}
     </div>
     <blockquote>${escapeHtml(e.quote)}</blockquote>
     <p class="ev-comment">${escapeHtml(e.comment)}</p>
@@ -91,9 +131,55 @@ function upgradeCard(a: ReviewResult["upgradePlan"][number], index: number): str
         ? `<div class="ex">
              <div class="ex-row"><span class="ex-tag ex-before">原</span><span>${escapeHtml(a.example.before)}</span></div>
              <div class="ex-row"><span class="ex-tag ex-after">改</span><span>${escapeHtml(a.example.after)}</span></div>
-           </div>`
-        : ""
+           </div>` +
+          // 示范里的"原句"没能在原文里定位到 = 模型很可能自己造了一句原文里没有的话。
+          // 不说出来的话，这份示范看起来和真的一模一样，学生照着一条不存在的
+          // "原句"去对照只会更困惑。判定见 lib/review.ts 的 locateExampleQuote
+          (a.exampleUnverified
+            ? `<p class="ex-flag">上面那个「原句」没能在原文中逐字找到，模型可能自己造了句子——请以原文为准。</p>`
+            : "")
+        : // 没有示范时不能留白：留白和"渲染坏了"长得一样。但也要说清这不是错误，
+          // 所以走中性配色的 .ex-flag-quiet
+          `<p class="ex-flag ex-flag-quiet">${
+            a.dimension === "organization"
+              ? "本条没有改写示范。结构类的建议有时落不到某一个句子上，照上面那句话做即可。"
+              : "本条没有改写示范，模型这次没能给出可照抄的句子——建议按上面那句话自己动手改一遍。"
+          }</p>`
     }
+  </div>`;
+}
+
+/**
+ * 一张训练卡。
+ *
+ * 和 React 那边的 components/TrainingPlan.tsx 结构一一对应，两边要一起改。
+ * 卡片里有两块来源不同的内容，必须靠 `.train-plain` 的浅底 + `.train-note`
+ * 那句说明区分开：`reason` 是模型针对这一篇写的，其余是同一类别的所有学生
+ * 都会看到的通用练法。混在一起，学生会把通用建议误当成针对自己的诊断。
+ */
+function trainingCard(t: TrainingItem): string {
+  const book = TRAINING_PLAYBOOK[t.focus];
+  const label = escapeHtml(TRAINING_FOCUS_LABEL[t.focus]);
+  const links = t.linkedEvidenceIds
+    .map((id) => `<a class="chip" href="#card-${escapeHtml(id)}">${escapeHtml(id)}</a>`)
+    .join("");
+
+  return `
+  <div class="card train-card">
+    <div class="train-head">
+      <span class="chip chip-solid">${label}</span>
+      ${links ? `<span class="chips">相关证据 ${links}</span>` : ""}
+    </div>
+    <p class="train-reason">${escapeHtml(t.reason)}</p>
+    <div class="train-plain">
+      <p class="train-note">以下是「${label}」这一类问题的通用练法，不是针对你这一篇写的。</p>
+      <p class="train-symptom">${escapeHtml(book.symptom)}</p>
+      <p class="train-label">写作时怎么做</p>
+      <ul class="plain">${book.howTo.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>
+      <p class="train-label">平时怎么练</p>
+      <ul class="plain">${book.drills.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>
+      <p class="train-watch"><strong>当心：</strong>${escapeHtml(book.watchOut)}</p>
+    </div>
   </div>`;
 }
 
@@ -177,10 +263,21 @@ const REPORT_CSS = `
 
   .essay { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px;
            white-space: pre-wrap; font-size: 15px; line-height: 2; box-shadow: var(--shadow); }
-  mark.ev { padding: 2px 1px; border-radius: 4px; cursor: help; }
+  mark.ev { padding: 2px 1px; border-radius: 4px; scroll-margin-block: 24px; }
   mark.ev-strength { background: var(--strength-bg); border-bottom: 2px solid var(--strength); }
   mark.ev-minor { background: var(--minor-bg); border-bottom: 2px solid var(--minor); }
   mark.ev-major { background: var(--major-bg); border-bottom: 2px solid var(--major); }
+
+  /*
+   * 原文高亮和证据卡片之间的双向跳转，**全部靠朴素的 #锚点 + :target**，
+   * 一行 JS 都没有——报告要能双击打开、发出去、打印成 PDF 都还好使。
+   *
+   * .ev-link 是 <mark> 里裹着的那层链接：它必须完全隐形，否则高亮里的字会变成
+   * 链接色，整段原文花掉。下划线也不能留。
+   */
+  .ev-link { color: inherit; text-decoration: none; }
+  mark.ev:target { outline: 2px solid var(--link); outline-offset: 1px; }
+  .ev-card:target { box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow); }
 
   .ev-head, .up-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
   .badge { font-size: 12px; padding: 2px 9px; border-radius: var(--radius-pill); font-weight: 600; }
@@ -190,6 +287,18 @@ const REPORT_CSS = `
   .dim { font-size: 12px; color: var(--muted); border: 1px solid var(--line); padding: 2px 8px; border-radius: var(--radius-pill); }
   .loc { font-size: 12px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
   .loc-bad { color: var(--major); }
+  /* 歧义徽章紧跟在坐标后面。坐标那一格有 margin-left: auto，所以这两块会
+     一起被推到右端，顺序仍是「坐标 · 定位方式」在前 -->
+     用 minor 的琥珀色而不是 major 的红色：这不是错误，是"请你自己确认一下" */
+  .amb { font-size: 11px; color: var(--minor); background: var(--minor-bg); border: 1px solid var(--minor-line);
+         border-radius: var(--radius-pill); padding: 1px 8px; white-space: nowrap; }
+  /* 严重程度是兜底来的：虚线下划线表示"这里还有话没说"（说了，在 title 和
+     报告顶部的警告里）。不改颜色，因为 minor 的配色本身没错 */
+  .badge[data-degraded] { border-bottom: 1px dashed currentColor; }
+  /* 坐标那一格现在是指回原文的链接。虚线是"可以点"的暗示，
+     实线下划线在这个位置太抢眼，会和徽章抢注意力 */
+  a.loc-link { color: var(--muted); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+  a.loc-link:hover { color: var(--link); }
   .ev-card { border-left: 3px solid var(--line); }
   .ev-card-strength { border-left-color: var(--strength); }
   .ev-card-minor { border-left-color: var(--minor); }
@@ -211,6 +320,34 @@ const REPORT_CSS = `
   .ex-tag { flex: 0 0 auto; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 4px; }
   .ex-before { background: var(--major-bg); color: var(--major); }
   .ex-after { background: var(--strength-bg); color: var(--strength); }
+  /*
+   * 改写示范的两种"不正常"状态：没给、给了但原文里找不到。必须显眼——
+   * 留白和渲染坏了长得一样，而一份编造的示范看起来和真的一模一样
+   */
+  .ex-flag { margin: 9px 0 0; font-size: 12.5px; line-height: 1.7; color: var(--minor);
+             background: var(--minor-bg); border: 1px solid var(--minor-line);
+             border-radius: var(--radius-sm); padding: 8px 11px; }
+  /* "没给"是中性信息，不是错误——虚线灰字，别用琥珀色的告警腔调 */
+  .ex-flag-quiet { color: var(--muted); background: transparent; border: 1px dashed var(--line); }
+
+  /*
+   * 训练区。⚠️ 这份 CSS 是**独立的另一份**，不是共用 app/globals.css 的——
+   * 报告要自包含，不能引用外部样式。所以改网页样式时这里要跟着改一遍，
+   * 类名也不必强求一致（比如这里有 ul.plain，网页那边叫 .plain-list）。
+   */
+  .chip-solid { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+  .train-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 11px; }
+  .train-reason { font-weight: 600; margin: 0 0 13px; font-size: 15px; line-height: 1.75; }
+  /* 浅底 + 内嵌边框：读起来像"附页"，和上面那段针对本篇的诊断分开 */
+  .train-plain { border: 1px solid var(--line); border-radius: var(--radius-sm);
+                 background: var(--surface-2); padding: 13px 15px; }
+  .train-note { margin: 0 0 11px; font-size: 12px; color: var(--muted); }
+  .train-symptom { margin: 0 0 12px; font-size: 13px; color: var(--ink-2); line-height: 1.75; }
+  .train-label { font-size: 12px; font-weight: 700; color: var(--ink-2); margin: 0 0 5px; }
+  .train-plain ul.plain { margin-bottom: 12px; font-size: 13.5px; line-height: 1.8; }
+  .train-watch { margin: 0; font-size: 13px; line-height: 1.7; color: var(--minor);
+                 background: var(--minor-bg); border: 1px solid var(--minor-line);
+                 border-radius: var(--radius-sm); padding: 9px 12px; }
 
   footer { margin-top: 44px; padding-top: 16px; border-top: 1px solid var(--line);
            color: var(--muted); font-size: 12px; line-height: 1.9; }
@@ -222,7 +359,9 @@ const REPORT_CSS = `
 
   @media print {
     body { background: #fff; padding: 0; }
-    .card, .score-main, .band-desc, .dim-card, .essay { break-inside: avoid; box-shadow: none; }
+    /* ⚠️ 这一行和 app/globals.css 的 @media print 是**两份**，训练卡的类名
+       两边都要加——只改一边的话，导出 PDF 时卡片会被切到两页上 */
+    .card, .score-main, .band-desc, .dim-card, .train-card, .essay { break-inside: avoid; box-shadow: none; }
     /* 纸上没有动画。不关掉的话，打印预览可能抓到 grow 的第一帧——一条空槽 */
     .meter i { animation: none; }
     .chip { color: var(--ink); }
@@ -270,8 +409,19 @@ export function buildReportHtml(
         .join("")}</ul></div>`
     : "";
 
-  const evidenceCards = result.evidence.map(evidenceCard).join("");
+  // 「证据 id → 原文锚点」整篇算一次，每张卡片自己算的话要跑 n 次切分
+  const anchors = anchorMap(result.essay ?? "", result.evidence);
+  const evidenceCards = result.evidence.map((e) => evidenceCard(e, anchors)).join("");
   const upgradeCards = result.upgradePlan.map(upgradeCard).join("");
+
+  // 训练区。没有就**整块不显示**，连标题都不留——一个"训练区"标题下面空着
+  // 比没有这一节更糟。
+  // `?? []` 不是防御性编程而是必须的：lib/store.ts 是盲 `as ReviewResult`，
+  // 升级前存下来的报告根本没有这个键。
+  const training = result.trainingPlan ?? [];
+  const trainingBlock = training.length
+    ? `<h2>训练区</h2>${training.map(trainingCard).join("")}`
+    : "";
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -303,6 +453,13 @@ export function buildReportHtml(
         <span><b>${stats.sentenceCount}</b> 句</span>
         <span><b>${stats.paragraphCount}</b> 段</span>
         <span><b>${stats.verifiedCount}/${stats.evidenceCount}</b> 条证据已定位</span>
+        ${
+          // 子计数，不是另一条分支：已定位/未定位的二分不变，这一项只在真的
+          // 有歧义时才出现。没有就不显示，避免给人一个"这项永远是 0"的印象
+          (stats.ambiguousCount ?? 0) > 0
+            ? `<span title="定位成功、但原文里有不止一处相近匹配"><b>${stats.ambiguousCount}</b> 条位置有歧义</span>`
+            : ""
+        }
       </div>
     </div>
   </div>
@@ -321,6 +478,8 @@ export function buildReportHtml(
 
   <h2>证据溯源（${stats.evidenceCount} 条）</h2>
   ${evidenceCards}
+
+  ${trainingBlock}
 
   <h2>原文批注</h2>
   <div class="essay">${renderHighlightedEssay(

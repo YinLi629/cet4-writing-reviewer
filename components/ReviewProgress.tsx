@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { ReviewProgress as ReviewProgressState } from "@/lib/types";
+import { FIRST_FRAME_DEADLINE_MS, readPhase, silenceHint } from "@/lib/watchdog";
 
 import { DiagnosisCard } from "./DiagnosisCard";
 import { EvidenceList } from "./EvidenceList";
@@ -10,9 +11,12 @@ import { EvidenceList } from "./EvidenceList";
 /**
  * 流式批改的等待界面：报告在输入页上边生成边长出来。
  *
- * 这个视图**用完就丢**——批改完成后照旧存 sessionStorage 再跳 /result，
+ * 这个视图**用完就丢**——批改完成后照旧存 localStorage 再跳 /result，
  * 权威报告在那边。所以它不需要和最终结果对账，也就没有"部分结果与最终结果
  * 不一致"这一类问题。它也绝不落盘、绝不传给导出 HTML 报告的那条路。
+ *
+ * 等待期间的两个阈值不在这里，在 lib/watchdog.ts——那个文件是所有超时数字的唯一定义处，
+ * 因为看门狗（lib/use-review-stream.ts）要拿同一组数去真的掐请求。见下面 silenceHint 的用法。
  *
  * 两条刻意的克制：
  *   · **不显示分数**。分数的最终值要过服务端的上限校正（依据模型自己标的
@@ -38,9 +42,6 @@ export interface ReviewProgressProps {
   /** 失败后放弃，回到表单 */
   onBack?: () => void;
 }
-
-/** 上游多久没有新内容就提示一句。服务端自己的停滞超时是 30 秒（REVIEW_STALL_MS） */
-const STALL_HINT_SECONDS = 20;
 
 export function ReviewProgress({
   progress,
@@ -71,9 +72,21 @@ export function ReviewProgress({
   }, [progress?.chars]);
 
   const chars = progress?.chars ?? 0;
-  const stalledSeconds = Math.floor((now - lastGrowthRef.current.at) / 1000);
-  // chars === 0 说明连第一个字符都还没来，那时"停滞"只是首字节延迟，不必吓人
-  const stalled = running && chars > 0 && stalledSeconds >= STALL_HINT_SECONDS;
+  const silentSeconds = Math.floor((now - lastGrowthRef.current.at) / 1000);
+
+  /**
+   * 提示分两段，判定的依据是「收到第一帧没有」。
+   *
+   * 这一条以前是错的：原来的门槛是 `chars > 0`，于是断在首帧之前（chars 恒为 0）
+   * 时提示**永远不会出现**——而那恰恰是最需要说话的时候。学生盯着「正在连接模型…」
+   * 和一直往上数的秒数，没有任何线索告诉他出事了。
+   *
+   * 两段的文案不同，是因为原因不同：首帧之前不来数据是上游排队（连心跳都还没开始），
+   * 首帧之后不来数据才是「有一会儿没动静」。说同一句话会误导。
+   */
+  const hint = running
+    ? silenceHint(readPhase(progress !== null), silentSeconds)
+    : null;
 
   const title = running
     ? progress
@@ -108,11 +121,23 @@ export function ReviewProgress({
           </div>
         )}
 
-        {stalled && (
+        {hint && (
           <div className="alert alert-warn alert-inline">
-            <strong>上游有一会儿没动静了</strong>
-            已经 {stalledSeconds} 秒没有新的内容。可能是模型在长思考，也可能是网络在抖。
-            服务端会在长时间无响应后主动放弃并报错。
+            {hint.phase === "streaming" ? (
+              <>
+                <strong>有一会儿没有新内容了</strong>
+                已经 {hint.seconds} 秒没有收到新的内容。可能是模型在长思考，也可能是网络断了。
+                两种都会有结果：服务端等不到上游会报错，这个页面收不到数据也会自己停下，
+                不会一直转下去。
+              </>
+            ) : (
+              <>
+                <strong>模型还没开始返回</strong>
+                已经等了 {hint.seconds} 秒。第一次出字通常不到一秒，等这么久多半是上游在排队。
+                超过 {FIRST_FRAME_DEADLINE_MS / 1000} 秒还没动静，这个页面会停下并告诉你——
+                不想等的话现在就可以取消，作文会留在输入框里。
+              </>
+            )}
           </div>
         )}
 

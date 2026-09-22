@@ -1,10 +1,18 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import { BANDS } from "@/lib/rubric";
 import { SAMPLE_ESSAYS } from "@/lib/samples";
-import { loadAccessCode } from "@/lib/store";
+import {
+  clearDraft,
+  type EssayDraft,
+  loadAccessCode,
+  loadDraft,
+  loadResult,
+  saveDraft,
+} from "@/lib/store";
 import { countEnglishWords } from "@/lib/text-stats";
 import {
   MAX_TOPIC_CHARS,
@@ -19,6 +27,28 @@ import { ReviewProgress } from "./ReviewProgress";
 const TARGET_MIN = 120;
 const TARGET_MAX = 180;
 
+/**
+ * 草稿的落盘防抖间隔。
+ *
+ * 500ms 是「打字时几乎不写盘」和「意外发生时最多丢半秒」之间的折中：
+ * 学生写 120 词至少要几分钟，敲键几百次，逐键写盘纯属浪费配额；
+ * 而真要出事（F5、后台回收标签页）时，半秒内的输入本来也少得可以忽略。
+ */
+const DRAFT_DEBOUNCE_MS = 500;
+
+/**
+ * 草稿的摘要，40 字以内。存在的理由只有一个：**让用户一眼认出这是不是自己写的**。
+ * 共用电脑上那份草稿可能是上一个人的，光说"有一份草稿"他没法判断，给一句原文就够了。
+ *
+ * 正文是空的（只存了题目）时退回题目——那份草稿仍然是用户的输入，值得被认出来，
+ * 而一对空引号只会让人以为界面出错了。两者都空的情况到不了这里：
+ * loadDraft() 用 isDraftEmpty 挡掉了。
+ */
+function draftExcerpt(draft: EssayDraft): string {
+  const text = (draft.essay.trim() || draft.topic.trim()).replace(/\s+/g, " ");
+  return text.length > 40 ? `「${text.slice(0, 40)}…」` : `「${text}」`;
+}
+
 export function EssayForm() {
   const [essay, setEssay] = useState("");
   const [topic, setTopic] = useState("");
@@ -27,6 +57,25 @@ export function EssayForm() {
   const [gated, setGated] = useState<boolean | null>(null);
   const [persistence, setPersistence] = useState<"postgres" | "memory" | null>(null);
   const [accessCode, setAccessCode] = useState("");
+  // 草稿是从 localStorage 异步读回来的，而「写草稿」的 effect 首帧就会跑一次。
+  // 没有这个开关的话，首帧那次的空状态会先把已存的草稿覆盖掉，再回填——白写一轮，
+  // 一旦中间出岔子（配额满、组件提前卸载）就直接把用户的作文弄丢了。
+  const [draftLoaded, setDraftLoaded] = useState(false);
+  // 上次没提交完的草稿：**读进来，但先不往输入框里放**，等用户点「恢复」。
+  // 理由和"为什么不做成自动回填"见下面那个 effect 的注释。
+  const [pendingDraft, setPendingDraft] = useState<EssayDraft | null>(null);
+  /**
+   * 这个浏览器上一份报告的生成时间；没有报告就是 null。
+   *
+   * 为什么表单页要关心这个：报告搬到 localStorage 之后，它的生命周期不再和任何
+   * 页面绑定，而全站**只有批改成功那一瞬间的自动跳转**能到达 /result。也就是说，
+   * 一个误关标签页、或者被系统回收了标签页的学生，报告是留下来了，却没有路回去——
+   * 那这次批改照样是白花的。所以这里必须给一个入口。
+   *
+   * 存时间而不是布尔值，是为了把它印出来：共用电脑上，"上次的报告"完全可能是
+   * 别人的。带上时间，看到的人自己就能判断。
+   */
+  const [lastReportAt, setLastReportAt] = useState<string | null>(null);
 
   // 一次批改的完整生命周期（请求、流式增量、终止态、跳转）都在这个 hook 里，
   // 表单只管收集输入和渲染
@@ -40,6 +89,101 @@ export function EssayForm() {
   useEffect(() => {
     setAccessCode(loadAccessCode() ?? "");
   }, []);
+
+  /**
+   * 把上次没提交完的草稿读进来，**但不回填**——只记在 pendingDraft 里等用户点。
+   *
+   * 为什么不做成自动回填（以前是自动的）：
+   *   · 教室机房、宿舍共用的电脑上，上一个人没提交完的作文会**原样出现在下一个人的
+   *     输入框里**。提示一句挡不住：他完全可能以为这是站点给的范文，顺手就提交了。
+   *     要点一下才会进输入框，误认的机会就没了。
+   *   · 更根本的是，自动回填是**改写用户正在编辑的东西**。同一个人回来时，
+   *     输入框该是他自己的，不是我们替他决定放进去的一份旧文本。
+   *
+   * 为什么必须放在 effect 里而不是 useState 的初始值里：初始值会在 SSR 阶段
+   * 也算一遍，服务端拿不到 localStorage，渲染出的是空表单，客户端却是有内容的，
+   * 水合(hydration)对不上，React 会直接报错。所以首帧一律是空的，挂载后再读。
+   *
+   * 顺序有讲究：这个 effect 必须排在下面「写草稿」那个前面。effect 按声明顺序执行，
+   * 这里同步调用的 setDraftLoaded 到下面那个 effect 运行时还是 false，
+   * 于是首帧那次写入被跳过——正好是我们要的。
+   */
+  useEffect(() => {
+    setPendingDraft(loadDraft());
+    setDraftLoaded(true);
+  }, []);
+
+  // 上一份报告还在不在。读的是时间戳而不是一个布尔值，理由见 lastReportAt 的声明
+  useEffect(() => {
+    const stored = loadResult();
+    setLastReportAt(stored ? stored.meta.createdAt : null);
+  }, []);
+
+  /** 恢复草稿：这一次才真的往输入框里放 */
+  const restoreDraft = (): void => {
+    if (!pendingDraft) return;
+    setEssay(pendingDraft.essay);
+    setTopic(pendingDraft.topic);
+    setTargetBandLevel(pendingDraft.targetBandLevel);
+    setPendingDraft(null);
+  };
+
+  /**
+   * 丢弃草稿。
+   *
+   * 只动存储和 pendingDraft，**不动输入框**——草稿还没被放进去过，这时它是空的。
+   * 以前这里要连带清三个字段，是因为那时草稿是自动回填的。
+   */
+  const discardDraft = (): void => {
+    clearDraft();
+    setPendingDraft(null);
+  };
+
+  /**
+   * 用户自己动手改了输入框 —— 那份没认领的旧草稿就此作废。
+   *
+   * 为什么非要有这一步：草稿没被认领时，下面那个写草稿的 effect 是**停摆**的
+   * （不这样，首帧的空表单会立刻把旧草稿覆盖掉）。这时如果用户无视提示直接开始写
+   * 新的，而不在这里把 pendingDraft 摘掉，他新写的内容会一句都存不下——他按 F5 回来，
+   * 提示的还是那份**旧的**，等于这个保险对"我就是要重写"的人失效了。
+   *
+   * 代价是旧草稿会被新内容覆盖（在 500ms 防抖之后）。这是可接受的：他是在看到
+   * 提示的情况下选择重写的。**改了会怎样**：去掉这一句，新写的作文就不会被保存。
+   */
+  const claimTyping = (): void => {
+    if (pendingDraft) setPendingDraft(null);
+  };
+
+  // 防抖写入。cleanup 里 clearTimeout 保证「只在停下来之后写一次」，
+  // 而不是每敲一个字就写一遍
+  useEffect(() => {
+    if (!draftLoaded) return;
+    // 已经批改成功就不该再落草稿了。少了这一句，下面 clearDraft 之后，
+    // 提交前刚敲下的那半秒输入还会被这个定时器写回去，草稿就复活了。
+    // 靠的是 effect 的声明顺序：它在 clearDraft 那个 effect 之前跑，
+    // 于是「先撤掉待触发的定时器，再删草稿」，中间没有窗口。
+    if (phase === "finished") return;
+    // 有一份还没认领的旧草稿时**停摆**：这一刻输入框是空的（草稿还没放进去），
+    // 照常写下去就等于把那篇旧作文删了——提示还挂着，内容已经没了。
+    // 用户一动手（claimTyping）它就被摘掉，这里随之恢复
+    if (pendingDraft) return;
+    const timer = setTimeout(() => {
+      // 三个字段全空时 saveDraft 内部会转成删除，不需要在这里特判
+      saveDraft({ essay, topic, targetBandLevel });
+    }, DRAFT_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [essay, topic, targetBandLevel, draftLoaded, phase, pendingDraft]);
+
+  /**
+   * 提交成功后把草稿删掉。
+   *
+   * 时机选 finished 而不是提交那一刻：这次批改要是失败了，作文还得留着让人重试。
+   * 而 finished 是「结果已经落盘、正在跳转」——这时草稿的使命已经完成，
+   * 再留着的话，用户从结果页回来会看到上一篇作文莫名其妙地躺在输入框里。
+   */
+  useEffect(() => {
+    if (phase === "finished") clearDraft();
+  }, [phase]);
 
   // 提前问一下服务端有没有配 key 和口令，别让用户写完作文才发现跑不起来
   useEffect(() => {
@@ -100,6 +244,21 @@ export function EssayForm() {
 
   return (
     <form onSubmit={handleSubmit} noValidate>
+      {/* 上一份报告的入口。放得低调是有意的：它是「顺带告诉你一声」，
+          不是这条流程的主线，不该跟下面那些报错抢注意力。
+          但必须得有——全站只有批改成功那一瞬间的自动跳转能到 /result，
+          少了这个链接，报告留下了也够不着 */}
+      {lastReportAt && (
+        <p className="last-report">
+          这个浏览器上还有一份{" "}
+          {new Date(lastReportAt).toLocaleString("zh-CN", { hour12: false })}
+          生成的批改报告。
+          <Link href="/result" className="last-report-link">
+            打开它
+          </Link>
+        </p>
+      )}
+
       {apiReady === false && (
         <div className="alert alert-error">
           <strong>服务端还没有配置 API Key</strong>
@@ -128,6 +287,25 @@ export function EssayForm() {
           ，要么是数据库连不上（后一种情况服务端日志里有一条告警）。本地开发无所谓，
           线上这样部署会让这道限制漏掉。在 Vercel 的环境变量里配好{" "}
           <code>DATABASE_URL</code> 后重新部署。
+        </div>
+      )}
+
+      {/* 用 warn 而不是 error：这是「提醒你留意一下」，不是出错。
+          摆的是**按钮**而不是自动回填，理由见 pendingDraft 的声明 */}
+      {pendingDraft && (
+        <div className="alert alert-warn">
+          <strong>这个浏览器上还留着一份草稿</strong>
+          <span className="draft-excerpt">{draftExcerpt(pendingDraft)}</span>
+          可能是上次没提交完的（刷新、或者手机把标签页回收了），也可能是你刚从报告页
+          「返回输入界面」带回来的。如果这不是你写的内容，点「丢弃」。
+          <div className="btn-row alert-actions">
+            <button type="button" className="btn" onClick={restoreDraft}>
+              恢复它
+            </button>
+            <button type="button" className="btn btn-ghost" onClick={discardDraft}>
+              丢弃
+            </button>
+          </div>
         </div>
       )}
 
@@ -181,7 +359,10 @@ export function EssayForm() {
           className="textarea textarea-short"
           placeholder="例如：Suppose you are a student who wants to join a volunteer program. Write a letter to the program organizer to apply for it. You should write at least 120 words."
           value={topic}
-          onChange={(e) => setTopic(e.target.value)}
+          onChange={(e) => {
+            claimTyping();
+            setTopic(e.target.value);
+          }}
           maxLength={MAX_TOPIC_CHARS}
           disabled={pending}
         />
@@ -197,7 +378,10 @@ export function EssayForm() {
           className="textarea textarea-essay"
           placeholder="Paste your essay here..."
           value={essay}
-          onChange={(e) => setEssay(e.target.value)}
+          onChange={(e) => {
+            claimTyping();
+            setEssay(e.target.value);
+          }}
           disabled={pending}
           spellCheck={false}
         />
@@ -212,7 +396,10 @@ export function EssayForm() {
           id="target"
           className="select field-narrow"
           value={targetBandLevel}
-          onChange={(e) => setTargetBandLevel(e.target.value)}
+          onChange={(e) => {
+            claimTyping();
+            setTargetBandLevel(e.target.value);
+          }}
           disabled={pending}
         >
           <option value="">不指定，按上一档给建议</option>
@@ -237,6 +424,8 @@ export function EssayForm() {
             type="button"
             className="btn"
             onClick={() => {
+              // 点示例也算"动手"：用户已经明确要写别的了，旧草稿不再提供
+              claimTyping();
               setEssay(s.text);
               setTopic(s.topic);
             }}

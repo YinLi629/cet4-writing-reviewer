@@ -92,7 +92,7 @@
  * prefers-color-scheme），所以不需要再写一份 @media 的令牌副本，
  * 也就不会有"两份深色值慢慢漂开"的问题。
  * 代价是无 JS 时只有浅色——而这个 app 没有 JS 本来就是个空壳（表单、fetch、
- * sessionStorage 全靠它），不值得为它维护第二份深色令牌。
+ * localStorage、流式读取全靠它），不值得为它维护第二份深色令牌。
  */
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -729,6 +729,7 @@ a {
 .dim-card,
 .ev-card,
 .up-card,
+.train-card,
 .essay-box {
   box-shadow: var(--shadow);
 }
@@ -1407,6 +1408,128 @@ blockquote.quote {
   color: var(--strength);
 }
 
+/*
+ * 改写示范的两种"不正常"状态：没给、给了但原文里找不到。
+ *
+ * 必须显眼（琥珀色），因为这两种情况原来看不出来——留白和渲染坏了长得一样，
+ * 而一份编造的示范看起来和真的一模一样。见 lib/review.ts 的 locateExampleQuote。
+ */
+.example-flag {
+  margin: 9px 0 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--minor);
+  background: var(--minor-bg);
+  border: 1px solid var(--minor-line);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+}
+
+/* "没给"是中性信息，不是错误——改成虚线灰字，别用琥珀色的告警腔调 */
+.example-flag-quiet {
+  color: var(--muted);
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--line);
+}
+
+/* ---------- 训练区 ---------- */
+
+/*
+ * 信息结构和升档建议同构（标签 + 一段针对本篇的话 + 一组条目），所以外形也照它。
+ * 但**刻意不做 hover 抬升**（.up-card 有）：训练卡里没有可点的东西，
+ * 抬一个点不动的容器是在假装它可以点。
+ */
+.train-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-bottom: 12px;
+}
+
+.train-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-bottom: 11px;
+}
+
+.train-links {
+  margin-left: auto;
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 模型给的诊断。和 .up-action 一样醒目——它说的是"你这篇为什么该练它" */
+.train-reason {
+  font-weight: 600;
+  margin: 0 0 13px;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+/*
+ * 查表来的通用练法。**必须在视觉上和上面那段诊断分开**，还配一句小字说明
+ * （.train-note）——否则学生会把"拿不准的词换掉"当成模型读了他这篇作文
+ * 得出的结论，而事实是同一类别的所有学生看到的是同一段话。
+ * 浅底 + 内嵌边框，读起来像"附页"而不是"针对你的判断"。
+ */
+.train-plain {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 13px 15px;
+}
+
+.train-note {
+  margin: 0 0 11px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.train-symptom {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  color: var(--ink-2);
+  line-height: 1.75;
+}
+
+.train-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-2);
+  margin: 0 0 5px;
+  letter-spacing: 0.02em;
+}
+
+.train-plain ul {
+  padding-left: 20px;
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  line-height: 1.8;
+}
+
+.train-plain ul:last-child {
+  margin-bottom: 0;
+}
+
+/* 常见误区。用 minor 的琥珀色——这是"当心别踩"，不是错误 */
+.train-watch {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--minor);
+  background: var(--minor-bg);
+  border: 1px solid var(--minor-line);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+}
+
 /* ---------- 原文批注 ---------- */
 
 .essay-box {
@@ -1449,6 +1572,79 @@ mark.ev-major {
   border-bottom: 2px solid var(--major-line);
 }
 
+/*
+ * 从证据卡片点「原文第 X–Y 字符」跳过来时，浏览器会把 URL 里 #锚点 指向的元素
+ * 标成 :target。**纯 CSS，不需要 JS**——这正是导出报告里反向跳转能做起来的原因。
+ *
+ * 和上面 .is-flash 的分工：那条走 JS 的 scrollIntoView（不改 URL，触发不了 :target），
+ * 管的是"点高亮跳到卡片"那个方向；这条管的是反方向。
+ *
+ * 落到顶部太贴边，留出一点余量
+ */
+mark.ev {
+  scroll-margin-block: 88px;
+}
+
+mark.ev:target {
+  outline: 2px solid var(--link);
+  outline-offset: 1px;
+  animation: target-pulse 1.2s var(--ease-out);
+}
+
+@keyframes target-pulse {
+  from {
+    box-shadow: 0 0 0 6px var(--accent-soft);
+  }
+}
+
+/*
+ * 锚点跳转默认是"瞬移"，从证据列表一下闪到原文批注会让人不知道发生了什么。
+ * 只在用户没要求减少动态效果时开；开了的话浏览器会瞬时跳过去，那正是他要的。
+ */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+  /* 分栏之后原文那一栏是自己滚的，而 scroll-behavior 不继承，html 上那条管不到它
+     ——不补这行，从证据卡跳回原文会是"瞬移"，和页面内其他跳转的手感不一致 */
+  .report-aside-scroll {
+    scroll-behavior: smooth;
+  }
+}
+
+/* 证据卡片上的坐标现在是个链接。它原来是个 <span>，
+   做成链接后不能突然变成蓝色带下划线——那会跟卡片的徽章抢注意力 */
+a.ev-loc-link {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+a.ev-loc-link:hover {
+  color: var(--link);
+}
+
+/* 定位歧义的徽章，紧跟在坐标后面。用 minor 的琥珀色而不是 major 的红色：
+   这不是错误，是"请你自己确认一下"。和导出的 HTML 报告里那条规则保持一致
+   （见 lib/report-html.ts 的 REPORT_CSS），两边的间距略有不同是有意的——
+   那边是静态文档，这边有悬停反馈 */
+.amb {
+  font-size: 11px;
+  color: var(--minor);
+  background: var(--minor-bg);
+  border: 1px solid var(--minor-line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+/* 严重程度是兜底来的（模型没给对 kind）。虚线下划线是"这里还有话没说"的
+   常规暗示——话在 title 里，也在报告顶部的警告里 */
+.badge[data-degraded] {
+  border-bottom: 1px dashed currentColor;
+}
+
 .legend {
   display: flex;
   gap: 16px;
@@ -1484,6 +1680,101 @@ mark.ev-major {
 .legend i.k-major {
   background: var(--major-bg);
   border: 1px solid var(--major-line);
+}
+
+/* ---------- 报告分栏（宽屏）---------- */
+
+/*
+ * 宽屏上原文和批改并排：左边原文（自己滚、跟着页面停住），右边结论与证据。
+ * 解决的是原来的痛点——核对一条证据要先滚下去、再滚回来找原文。
+ *
+ * ⚠️ 整块只挂在 `screen and (min-width: 1280px)` 上，于是**打印天然是单栏**：
+ * 不用在 @media print 里再摊平一次（那种"屏幕一份、纸上再写一遍"的写法最容易漏掉
+ * 一半，症状是纸上只印出侧栏的第一屏）。导出的 HTML 报告（lib/report-html.ts）
+ * 是另一套样式，压根没有这一块，也保持单栏。
+ *
+ * 断点定在 1280px：容器封顶在 960px，所以拆不拆跟窗口宽度没关系、只跟"够不够宽"
+ * 有关——门槛抬高之后，小笔记本和平板保持单栏（那一栏更宽、更好读），
+ * 分给两栏的宽度在两个世界里都是同一个数。
+ */
+@media screen and (min-width: 1280px) {
+  .report-layout {
+    display: grid;
+    /* 左栏是"参照物"，宽度钉死而不是按比例分配：窗口再宽，正文的行宽也不变，
+       视线不用每次重新找位置。360px 减掉 24px×2 的内边距，英文约 40 字符一行
+       ——比常规的 45~75 偏窄，是拿行宽换右栏宽度的取舍 */
+    grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+    gap: 26px;
+    align-items: start;
+  }
+
+  /* DOM 里批改在前、原文在后（理由见 ReportView 的注释），这里把原文摆到左边。
+     两栏都写死 grid-row: 1，这样行高由高的那栏（批改）决定，左栏才有跟着停的余地 */
+  .report-aside {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .report-main {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .report-aside {
+    position: sticky;
+    /* 上边界从顶栏底下开始——顶栏也是 sticky 的，不减掉就会被它盖住 */
+    top: calc(var(--header-h) + 18px);
+    /* 高度必须按视口封顶：不封的话长作文会把底部一截顶到看不见的地方，
+       而且 sticky 元素一旦高过视口，贴着的那部分永远滚不出来。
+       两行是同一件事，svh 才是手机上"看得见的那块"（同 .landing 的写法） */
+    max-height: calc(100vh - var(--header-h) - 36px);
+    max-height: calc(100svh - var(--header-h) - 36px);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 标题留在滚动区外面，不跟着原文滚。上边距归零，让它和右栏正文的顶边对齐 */
+  .report-aside .section-title {
+    margin-top: 0;
+  }
+
+  /*
+   * 真正滚的是这一段。
+   *
+   * min-height: 0 **不能省**：flex 子项的默认最小高度是内容高度，不写这行
+   * overflow 就不生效，侧栏会照着作文的长度把整页撑长——sticky 也就白设了。
+   * 症状是"分栏看起来生效了，但滚到一半左栏就跑没了"。
+   *
+   * overscroll-behavior: contain 是为了滚到底时不顺手把整页也带下去。
+   */
+  .report-aside-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* 系统默认的滚动条在这个窄栏里太占地方，捞掉一截正文宽度 */
+    scrollbar-width: thin;
+  }
+
+  /*
+   * 下面两条是被分栏逼出来的：`.scoreboard` / `.dims` 的断点是按**视口**写的
+   * （720 / 860），而分栏之后右栏只有 534px（920 的容器减掉 360 的左栏和 26 的
+   * 间隙），比它们设想的最窄情况还窄，那两个断点永远不触发。所以按**栏宽**重写：
+   *
+   * - 分数板：两列的下限加起来正好是 534px（240 + 280 + 14 的间隙），和右栏一样宽
+   *   —— 一点余量都没有，留着就是在赌"不会有任何 1px 的偏差"。这里是分栏这一侧
+   *   唯一能确定的地方，所以直接单列
+   * - 维度卡：交给 auto-fit 按栏宽自己决定。260px 这个下限挑过：右栏 534px 时分成
+   *   2 列、每张 261px，和原设计在 860px 断点上验过的 278px 很接近；而 3 列需要
+   *   804px，右栏到不了，所以不必担心分出三列把字挤扁
+   */
+  .report-main .scoreboard {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .report-main .dims {
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  }
 }
 
 /* ---------- 加载 ---------- */
@@ -1644,6 +1935,59 @@ mark.ev-major {
   margin-top: 6px;
 }
 
+/* 提示句子里内嵌的按钮（比如「已恢复草稿…丢弃它」）。
+   它读起来是句子的一部分，所以不能是药丸——按内联链接来做：
+   去掉 .btn 的固定行高和内边距，只留颜色和下划线。 */
+.alert-discard {
+  display: inline;
+  padding: 0;
+  border: 0;
+  margin: 0;
+  height: auto;
+  min-height: 0;
+  font-size: inherit;
+  font-weight: 600;
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  vertical-align: baseline;
+}
+
+.alert-discard:hover:not(:disabled) {
+  background: transparent;
+  color: inherit;
+  opacity: 0.75;
+}
+
+/* 草稿摘要（「上次没提交的内容还留着」那条提示里）。
+   它是整条提示里唯一需要被"读出来"的东西——用户靠它认出这是不是自己写的——
+   所以给它字重和正文色抬高一级。不用斜体：中文的斜体是伪斜体，糊。 */
+.draft-excerpt {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* 提示里的按钮行（恢复它 / 丢弃）。和上面的句子拉开距离，别和文字挤在一起 */
+.alert-actions {
+  margin-top: 12px;
+}
+
+/* 表单页顶部那条「这个浏览器上还有一份报告」。
+   刻意做得比 alert 轻：它是顺带一提，不是警告 */
+.last-report {
+  margin: 0 0 16px;
+  font-size: 13.5px;
+  color: var(--muted);
+}
+
+/* 链接本身用全站的 --link（a 的基础样式），只补一点间距和字重 */
+.last-report-link {
+  margin-left: 6px;
+  font-weight: 600;
+}
+
+
 /* 卡片内部靠下、贴着底的那一块提示条 */
 .alert-inline {
   margin-top: 16px;
@@ -1696,6 +2040,54 @@ mark.ev-major {
 
 .result-actions {
   margin-bottom: 18px;
+}
+
+/* ---------- 回到顶部 ---------- */
+
+/*
+ * 固定右下角，滚过一屏才淡入（判定在 components/BackToTop.tsx）。
+ *
+ * 隐藏态用的是 opacity + pointer-events，不是 display:none —— 后者没有过渡，
+ * 按钮会突然弹出来；而**只**关透明度是不够的：那样一个看不见的按钮仍然浮在那里
+ * 劫持点击，正好挡住它下面那一块内容。
+ */
+.back-to-top {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 30;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-lift);
+  opacity: 0;
+  transform: translateY(10px);
+  pointer-events: none;
+  transition: opacity var(--dur-2) var(--ease), transform var(--dur-2) var(--ease-out),
+    background var(--dur-1) var(--ease);
+}
+
+.back-to-top[data-visible="1"] {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.back-to-top:hover {
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+}
+
+/* 键盘焦点要看得见：这是个只靠图标表达的按钮，焦点环的存在感得比按钮本身强 */
+.back-to-top:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* 结果页的 hero 比首页矮一截：上面没有一句话介绍要放 */
@@ -1784,6 +2176,8 @@ html[data-reveal-ready] .reveal.is-in {
   .site-header,
   .btn,
   .sample-row,
+  /* 悬浮按钮在纸上没有意义：它固定在一个位置上，挡住正文而且点不动 */
+  .back-to-top,
   /* 纸上不需要表情包墙：它是屏幕上的玩笑，打出来只是一堆灰点 */
   .meme-wall {
     display: none !important;
@@ -1794,6 +2188,7 @@ html[data-reveal-ready] .reveal.is-in {
   .card,
   .ev-card,
   .up-card,
+  .train-card,
   .essay-box {
     break-inside: avoid;
   }

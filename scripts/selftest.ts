@@ -6,10 +6,11 @@
  */
 
 import { getAccessCode, hasAccessCode, verifyAccessCode } from "../lib/access";
+import { chatJSON, LLMError, openChatStream } from "../lib/deepseek";
 import { locateQuote, attachLocations } from "../lib/evidence";
-import { segmentEssay } from "../lib/highlight";
+import { ANCHOR_PREFIX, anchorMap, segmentEssay } from "../lib/highlight";
 import { scanJsonPrefix, type ScanResult, type ScannedMember } from "../lib/json-stream";
-import { METHOD_LABEL } from "../lib/labels";
+import { METHOD_LABEL, TRAINING_FOCUS_LABEL } from "../lib/labels";
 import { MAX_EVIDENCE } from "../lib/prompt";
 import {
   buildFailureUpsert,
@@ -37,10 +38,19 @@ import {
   type RateLimitPolicy,
 } from "../lib/rate-limit";
 import {
+  ACCESS_DENIED_MESSAGE,
+  humanizeWait,
+  lockedAfterFailureMessage,
+  lockedMessage,
+  MISSING_CONFIG_MESSAGE,
+  penalizeAccessFailure,
+} from "../lib/access-gate";
+import {
   createMemoryStore,
   persistenceMode,
   SWEEP_RETENTION_WINDOWS,
   withFallback,
+  type RateLimitGate,
 } from "../lib/rate-limit-store";
 import { buildReportHtml, escapeHtml, renderHighlightedEssay } from "../lib/report-html";
 import { MAX_BODY_BYTES, readJsonBody } from "../lib/request-body";
@@ -50,20 +60,56 @@ import {
   bandForScore,
   CEILING_RULE_TABLE,
   clampScore15,
+  readScore15,
+  score15Field,
   enforcedCeilings,
   strictestCeiling,
   toScore106,
   tierGapFor,
   type CeilingContext,
 } from "../lib/rubric";
-import { __internals, normalizeInput, reviewEssay, reviewEssayStream } from "../lib/review";
+import {
+  __internals,
+  coerceExample,
+  coerceKind,
+  locateExampleQuote,
+  normalizeInput,
+  reviewEssay,
+  reviewEssayStream,
+} from "../lib/review";
 import { createSseFrameParser, encodeSseFrame, SSE_RESPONSE_HEADERS } from "../lib/sse";
+import {
+  coerceDraft,
+  isDraftEmpty,
+  isResultFresh,
+  loadDraft,
+  RESULT_FRESH_MS,
+  saveDraft,
+} from "../lib/store";
 import { computeStats } from "../lib/text-stats";
+import {
+  coerceTrainingFocus,
+  TRAINING_FOCUS_DIMENSION,
+  TRAINING_FOCUSES,
+  TRAINING_PLAYBOOK,
+} from "../lib/training";
+import {
+  deadlineCode,
+  deadlineFor,
+  deadlineMessage,
+  FIRST_FRAME_DEADLINE_MS,
+  readPhase,
+  silenceHint,
+  SILENCE_HINT_SECONDS,
+  STREAM_STALL_DEADLINE_MS,
+} from "../lib/watchdog";
 import {
   MAX_QUOTE_CHARS,
   MAX_TOPIC_CHARS,
+  type Evidence,
   type ReviewResult,
   type ReviewStreamEvent,
+  type TrainingFocus,
 } from "../lib/types";
 
 let passed = 0;
@@ -181,6 +227,86 @@ check(
 );
 
 // ---------------------------------------------------------------------------
+// [1b] 定位歧义：找到了，但可能找错了
+//
+// 上面那条"重复句"是**正确**处理：同一句话被两条证据引用时各占一处。
+// 这一节盯的是它旁边那个安静得多的失败模式——只有一条证据、而原文里有好几处
+// 都能匹配。这时定位代码仍然取第一处、仍然报 method: "exact"、仍然 verified，
+// 报告上带着"逐字命中原文"的徽章高亮到**别的那一句**上，用户没有任何线索。
+//
+// 所以断言的不是"取哪一处"（那本来就只能是猜），而是**这件事有没有被说出来**。
+// method 一个字都不许变：它回答"怎么匹配上的"，那几处确实都是逐字命中。
+// ---------------------------------------------------------------------------
+console.log("\n[1b] 定位歧义");
+
+const AMBI = "He is tall. The weather is nice today. He is tall.";
+const ambigShort = locateQuote(AMBI, "He is tall.");
+eq("多处逐字命中：仍然报 exact（匹配方式没有疑问）", ambigShort.method, "exact");
+eq("多处逐字命中：仍然算定位成功", ambigShort.start !== null, true);
+eq("多处逐字命中：歧义原因", ambigShort.ambiguity, "multiple");
+eq("多处逐字命中：候选处数", ambigShort.hitCount, 2);
+// 用切片断言而不是写死下标：写死的话，改一个字符就要重算一遍魔数，
+// 而真正要钉住的是"它落在了某一处完整的那句话上"
+eq(
+  "多处逐字命中：落在第一处完整的那句话上（当下最合理的猜测）",
+  AMBI.slice(ambigShort.start!, ambigShort.end!),
+  "He is tall.",
+);
+
+// 只出现一次的引文不该被染上歧义——否则每条证据都挂着徽章，用户很快就学会无视它
+const ambigNone = locateQuote(AMBI, "The weather is nice today.");
+eq("唯一命中：没有歧义", ambigNone.ambiguity, undefined);
+eq("唯一命中：没有候选数", ambigNone.hitCount, undefined);
+
+// 归一化路径同样有多处命中的问题（大小写/空白不同，但确实是同一句话）
+const AMBI_CASE = "he is tall. Some filler sentence. HE IS TALL.";
+const ambigNorm = locateQuote(AMBI_CASE, "He is tall.");
+eq("归一化后多处命中：仍报 normalized", ambigNorm.method, "normalized");
+eq("归一化后多处命中：同样标出歧义", ambigNorm.ambiguity, "multiple");
+
+// 归一化路径的候选数：这里不该算上被 claimed 占掉的那些，
+// 否则同一批引文的数量统计会随证据顺序漂移
+const ambigNormClaimed = locateQuote(AMBI_CASE, "He is tall.", [[0, 11]]);
+eq("候选数与是否被占用无关（统计不随排序漂移）", ambigNormClaimed.hitCount, 2);
+eq(
+  "候选数与是否被占用无关：落点让给了空着的那处",
+  AMBI_CASE.slice(ambigNormClaimed.start!, ambigNormClaimed.end!),
+  "HE IS TALL.",
+);
+
+// 模糊匹配：落在哪一处本来就只是近似。窗口长度会取 n-1/n/n+1 三种，
+// 同一处命中会产生好几个重叠窗口，所以数"几处"必须先按区间合并
+const FUZZY_ESSAY =
+  "Last year I also join a activity about cleaning the park. " +
+  "Some other words in between here. " +
+  "Last year I also joined an activity about cleaning the park.";
+const fuzzyMulti = locateQuote(
+  FUZZY_ESSAY,
+  "Last year I also joined a activity about cleaning the park",
+);
+eq("模糊匹配：方法仍是 fuzzy", fuzzyMulti.method, "fuzzy");
+eq("模糊匹配：多处近似时标出歧义", fuzzyMulti.ambiguity, "multiple");
+eq(
+  "模糊匹配：重叠窗口按区间合并后只算 2 处（不把一次命中数成三四次）",
+  fuzzyMulti.hitCount,
+  2,
+);
+
+// attachLocations 要把歧义贴到 Evidence 上——渲染层读的就是那两个字段
+const ambiAttached = attachLocations(AMBI, [
+  { id: "e1", dimension: "language", kind: "minor", quote: "He is tall.", comment: "a" },
+]);
+eq("attachLocations：歧义被贴到证据上", ambiAttached[0].ambiguity, "multiple");
+eq("attachLocations：候选数一并带上", ambiAttached[0].hitCount, 2);
+
+// 没定位上的条目不该带歧义："有多处候选"和"根本没找到"是两句互相打架的话
+const ambiMiss = attachLocations(AMBI, [
+  { id: "e1", dimension: "language", kind: "minor", quote: "Nowhere to be seen.", comment: "a" },
+]);
+eq("没定位上的条目：verified 为假", ambiMiss[0].verified, false);
+eq("没定位上的条目：不挂歧义（那是自相矛盾的说法）", ambiMiss[0].ambiguity, undefined);
+
+// ---------------------------------------------------------------------------
 console.log("\n[2] 档次查表与分数折算");
 
 eq("0 分 → 0 分档", bandForScore(0).label, "0 分档");
@@ -283,6 +409,98 @@ eq("没上限时分毫不动", applyCeiling(13, ceil()), 13);
 eq("1 条 major 时 13 分不动（不误伤好作文）", applyCeiling(13, ceil({ majorCount: 1 })), 13);
 
 // ---------------------------------------------------------------------------
+// [2c] score15 的入口收拢（全文唯一的计分来源）
+//
+// 这是整轮里最该防守的一处：`score15` 是**唯一**决定分数和档次的值，而它原来的
+// 校验是全部入口里最弱的（`typeof n === "number" ? n : 0`）。模型把分数写成字符串
+// 时，学生拿到一份看起来完全正常、实际 0 分 0 档的报告，不报错也不告警。
+//
+// 这张表逐条列出"什么算数、什么不算"。判据的边界都在这里钉着，因为任何一条放宽
+// 都会重新打开那个静默出错的入口。特别是**不能拿 Number() 来兜底**：
+// Number("") === 0、Number(" ") === 0、Number("0x10") === 16、Number(true) === 1，
+// 每一条都会把"模型没给分数"变成一个具体的、看起来合理的分数。
+// ---------------------------------------------------------------------------
+console.log("\n[2c] score15 的入口收拢");
+
+// —— 该收的 ——
+eq("数字原样通过", readScore15(12), 12);
+eq("0 是合法分数（不是“没给”）", readScore15(0), 0);
+eq("15 是合法分数", readScore15(15), 15);
+eq("数字字符串被收下（模型的常见写法）", readScore15("12"), 12);
+eq("带空白的数字字符串", readScore15(" 12 "), 12);
+eq("带正号的数字字符串", readScore15("+3"), 3);
+eq("小数按四舍五入进整数档", readScore15(9.6), 10);
+eq("小数落在 .5 上按四舍五入", readScore15("8.5"), 9);
+eq("省略整数部分的写法", readScore15(".5"), 1);
+eq("越界超上限被夹紧", readScore15(99), 15);
+eq("越界负数被夹紧", readScore15(-3), 0);
+
+// —— 不该收的：每一条都必须落 0，而且必须能被 score15Field 认出来 ——
+const unusable: Array<[string, unknown]> = [
+  ["空字符串", ""],
+  ["纯空白", "   "],
+  ["数字后面跟着废话", "12abc"],
+  ["数字开头的中文", "12分"],
+  ["十六进制写法（Number 会读成 16）", "0x10"],
+  ["科学计数法（Number 会读成 100）", "1e2"],
+  ["NaN 字符串", "NaN"],
+  ["Infinity 字符串", "Infinity"],
+  ["布尔 true（Number 会读成 1）", true],
+  ["布尔 false（Number 会读成 0，看着像正常分数）", false],
+  ["null（Number 会读成 0）", null],
+  ["undefined", undefined],
+  ["数字 NaN", Number.NaN],
+  ["数字 Infinity", Number.POSITIVE_INFINITY],
+  ["数组", [12]],
+  ["对象", { score15: 12 }],
+  ["空对象", {}],
+];
+for (const [label, value] of unusable) {
+  eq(`不收：${label} → 0 分`, readScore15(value), 0);
+  eq(`不收：${label} → 能被认出是无效值`, score15Field(value), "unusable");
+}
+
+// 收下的那几种要能和"无效"区分开，否则 lib/review.ts 那条警告会误报
+eq("数字 → 字段是 number", score15Field(12), "number");
+eq("数字字符串 → 字段是 numeric-string", score15Field("12"), "numeric-string");
+eq("带空白的数字字符串也算 numeric-string", score15Field(" 12 "), "numeric-string");
+
+// clampScore15 是数值层的夹紧，保持原样：readScore15 收不下的值一律落 0，
+// 而 clampScore15 仍然只认 number（它是给已经确定是数字的调用方用的）
+eq("clampScore15 对非数字仍然落 0", clampScore15("12" as never), 0);
+eq("clampScore15 对数字照旧夹紧", clampScore15(9.6), 10);
+
+// —— 两个函数必须永远一致 ——
+// readScore15 决定分数，score15Field 决定"要不要出声"。两者判据一分叉，
+// 就会出现介于"读出来了"和"报了警"之间的第三种状态：分数是 0，而没人告诉用户。
+// 那正是这一轮要消灭的静默出错，所以这里穷举着钉一遍。
+// （这条在写的时候真抓到过一个：NaN 是 typeof "number"，score15Field 说它是
+//   number，而 readScore15 读成 0——一份 0 分报告，零条警告。）
+const consistencyProbe: unknown[] = [
+  12, 0, 15, 9.6, -3, 99, Number.NaN, Number.POSITIVE_INFINITY, "12", " 12 ", "+3", "8.5", ".5",
+  "99999", "9".repeat(400),
+  ...unusable.map(([, value]) => value),
+];
+let inconsistent = 0;
+for (const value of consistencyProbe) {
+  if (score15Field(value) === "unusable" && readScore15(value) !== 0) inconsistent += 1;
+}
+eq(
+  `一致性：${consistencyProbe.length} 个值里，没有一个"判为无效却读出了非 0 分"`,
+  inconsistent,
+  0,
+);
+// 反向也要成立：能被判为有效的值不该读到 0 分（负数/0 例外，那是真的夹紧）
+let silentlyZero = 0;
+for (const value of consistencyProbe) {
+  const field = score15Field(value);
+  if (field !== "unusable" && readScore15(value) === 0) {
+    if (!(typeof value === "number" && value <= 0)) silentlyZero += 1;
+  }
+}
+eq(`一致性：判为有效的值也不会悄悄读成 0 分`, silentlyZero, 0);
+
+// ---------------------------------------------------------------------------
 console.log("\n[3] 文本统计");
 
 const stats = computeStats("Hello world. This is a test!\n\nSecond paragraph here.");
@@ -367,7 +585,7 @@ const plan = __internals.parseUpgradePlan(
     { priority: 9, dimension: "language", action: "先修时态", rationale: "r" },
     { priority: 2, dimension: "language", action: "先修时态", rationale: "r" }, // 与上一条重复
     { priority: 2, dimension: "content", action: "明确立场", rationale: "r" },
-    { dimension: "organization", action: "加衔接词", rationale: "r", example: { before: "a", after: "b" } },
+    { dimension: "organization", action: "加衔接词", rationale: "r", example: { before: "he go to school", after: "he goes to school" } },
     { priority: 1, dimension: "language", action: "", rationale: "空 action 应被丢弃" },
   ],
   [
@@ -375,6 +593,8 @@ const plan = __internals.parseUpgradePlan(
   ],
   3,
   undefined,
+  // essay 参数（第 5 个）是为了核查 example.before 在不在原文里，见 lib/review.ts
+  "he go to school every day.",
 );
 eq("空 action 被丢弃、重复被去重", plan.length, 3);
 eq("priority 被规整为连续的 1..n", plan.map((p) => p.priority), [1, 2, 3]);
@@ -382,6 +602,235 @@ check(
   "未指定关联证据的会自动挂同维度证据",
   plan.find((p) => p.dimension === "language")!.linkedEvidenceIds.includes("e1"),
   plan,
+);
+const withEx = plan.find((a) => a.dimension === "organization")!;
+eq("example 保留下来", withEx.example, { before: "he go to school", after: "he goes to school" });
+// before 逐字在原文里 → 不该被打上"编造"标记（eq 看不见 undefined 值的键，所以用 in）
+check("能定位的 example 不打 exampleUnverified", !("exampleUnverified" in withEx), withEx);
+check("给了 example 就不打 exampleMissing", !("exampleMissing" in withEx), withEx);
+eq(
+  "没给 example 的会被标出来（不是静默留白）",
+  plan.filter((a) => a.exampleMissing === true).length,
+  2, // 先修时态 / 明确立场 两条没给，加衔接词那条给了
+);
+
+// ---------------------------------------------------------------------------
+// [5b] kind 的兜底必须留下痕迹
+//
+// `kind` 同时喂给展示（颜色）和判分（按 major 条数算的分数上限）。原来的兜底是
+// 无声的：不是三个合法值就一律返回 minor（**最轻**的一档），于是一次字段异常会
+// 悄悄把"3 条以上严重错误 → 上限 9 分""5 条以上 → 上限 6 分"整条掐掉，
+// 模型的 11 分照旧发出去，报告上没有任何异常——这才是它比"丢弃"更危险的地方。
+//
+// 兜底值不变（仍是 minor），变的是**这件事被记下来**：coerceKind 返回 degraded，
+// parseEvidenceItem 把它落到 kindDegraded 上，assembleResult 再据此出一条警告。
+// ---------------------------------------------------------------------------
+console.log("\n[5b] kind 的兜底留下痕迹");
+
+eq("strength 原样通过", coerceKind("strength"), { kind: "strength", degraded: false });
+eq("major 原样通过", coerceKind("major"), { kind: "major", degraded: false });
+eq("minor 原样通过", coerceKind("minor"), { kind: "minor", degraded: false });
+// 归一化逻辑不动：大小写和空白是排版噪声，不是模型的错误
+eq("大小写被归一，不算降级", coerceKind("MAJOR"), { kind: "major", degraded: false });
+eq("首尾空白被裁掉，不算降级", coerceKind("  minor "), { kind: "minor", degraded: false });
+
+// 这些都必须降级为 minor **并且**被标记出来
+const badKinds: Array<[string, unknown]> = [
+  ["自造的档位", "severe"],
+  ["中文的严重程度", "严重错误"],
+  ["别的体系的用词", "error"],
+  ["空字符串", ""],
+  ["缺失（undefined）", undefined],
+  ["null", null],
+  ["数字", 3],
+  ["布尔", true],
+  ["对象", { kind: "major" }],
+  ["数组", ["major"]],
+];
+for (const [label, value] of badKinds) {
+  eq(`兜底：${label} → minor`, coerceKind(value).kind, "minor");
+  eq(`兜底：${label} → 留下痕迹`, coerceKind(value).degraded, true);
+}
+
+// 落到证据条目上：降级的那条要带 kindDegraded，正常的那条不能带
+const kinded = __internals.parseEvidence([
+  { dimension: "language", kind: "severe", quote: "I very like help", comment: "自造档位" },
+  { dimension: "language", kind: "MAJOR", quote: "I also want join", comment: "正常" },
+]);
+// 关键：**条目保留**。丢弃它会让证据条数缩水，进而触发"证据偏少"的警告甚至
+// BAD_MODEL_OUTPUT——把一个字段写错升级成"这次批改失败"，代价不成比例
+eq("降级的条目被保留下来（不是丢弃）", kinded.length, 2);
+eq("降级的那条按 minor 处理", kinded[0].kind, "minor");
+eq("降级的那条带上了标记", kinded[0].kindDegraded, true);
+eq("正常的那条不带标记", kinded[1].kindDegraded, undefined);
+eq("正常的那条仍是 major（大小写归一不受影响）", kinded[1].kind, "major");
+
+// ---------------------------------------------------------------------------
+console.log("\n[5c] 训练区与升档示范的核查");
+
+// --- 练法查表必须是"满"的 --------------------------------------------------
+//
+// `Record<TrainingFocus, TrainingPlaybook>` 已经保证**键齐全**（漏一个键
+// TypeScript 直接报错），但保证不了**内容非空**——`howTo: []`、`symptom: ""`
+// 都是合法类型。而空内容才是真正会流到学生眼前的那种故障，所以两条都得断言。
+for (const focus of TRAINING_FOCUSES) {
+  const book = TRAINING_PLAYBOOK[focus];
+  check(`练法表：${focus} 有 symptom`, book.symptom.trim().length > 0, book.symptom);
+  check(`练法表：${focus} 有 watchOut`, book.watchOut.trim().length > 0, book.watchOut);
+  check(`练法表：${focus} 至少 3 条 howTo`, book.howTo.length >= 3, book.howTo.length);
+  check(`练法表：${focus} 至少 2 条 drills`, book.drills.length >= 2, book.drills.length);
+  check(
+    `练法表：${focus} 没有空条目`,
+    [...book.howTo, ...book.drills].every((s) => s.trim().length > 0),
+    [...book.howTo, ...book.drills],
+  );
+}
+
+// 条数绊线。加类别是**有意**的动作，改动这一行就说明你想过了——这才是它的用处。
+eq("练法表覆盖 13 个类别", TRAINING_FOCUSES.length, 13);
+check("TRAINING_FOCUSES 无重复", new Set(TRAINING_FOCUSES).size === TRAINING_FOCUSES.length);
+
+// 没有标签，卡片头就是一片空白；TypeScript 挡得住"漏键"，挡不住"值是空串"
+for (const focus of TRAINING_FOCUSES) {
+  check(`标签表：${focus} 有非空标签`, (TRAINING_FOCUS_LABEL[focus] ?? "").trim().length > 0);
+}
+
+// 维度映射只在"模型没给关联证据"时兜底。映射错了，卡片上的"相关证据"
+// 会链到一篇毫不相干的原文片段上——比不链更让人困惑。
+const VALID_DIMENSIONS = ["content", "language", "organization"];
+for (const focus of TRAINING_FOCUSES) {
+  check(
+    `维度映射：${focus} 指向合法维度`,
+    VALID_DIMENSIONS.includes(TRAINING_FOCUS_DIMENSION[focus]),
+    TRAINING_FOCUS_DIMENSION[focus],
+  );
+}
+
+// --- focus 的收敛：归一化"写法"，拒绝"未知语义" -----------------------------
+eq("spelling 原样通过", coerceTrainingFocus("spelling"), "spelling");
+eq("带连字符的类别原样通过", coerceTrainingFocus("noun-article"), "noun-article");
+// 大小写和两端空白是排版噪声，不是模型的理解错误。整篇只有 1-3 条训练项，
+// 因为首字母大写就**整条丢掉**，代价和收益完全不成比例（对比 kind 的降级处理）。
+eq("大写被归一，不算非法", coerceTrainingFocus("SPELLING"), "spelling");
+eq("两端空白被裁掉", coerceTrainingFocus("  tense "), "tense");
+eq("混写被归一", coerceTrainingFocus("Noun-Article"), "noun-article");
+
+// 这些是**真的认不出来**，必须返回 null，不能兜底到某一类：
+// kind 兜错只是颜色偏轻，focus 兜错是配出一整套**错误的练法**，比少一条糟得多。
+const badFocuses: Array<[string, unknown]> = [
+  ["拼错的单词", "speling"],
+  ["中文标签", "时态"],
+  ["自造类别", "grammar"],
+  ["别家体系的用词", "vocabulary"],
+  ["空字符串", ""],
+  ["纯空白", "   "],
+  ["undefined", undefined],
+  ["null", null],
+  ["数字", 3],
+  ["布尔", true],
+  ["对象", { focus: "tense" }],
+  ["数组", ["tense"]],
+];
+for (const [label, value] of badFocuses) {
+  eq(`不收：${label} → null`, coerceTrainingFocus(value), null);
+}
+
+// --- 训练项解析 -------------------------------------------------------------
+const TRAIN_EVIDENCE: Evidence[] = [
+  { id: "e1", dimension: "language", kind: "major", quote: "q1", comment: "c", start: 0, end: 2, verified: true, locateMethod: "exact" },
+  { id: "e2", dimension: "language", kind: "minor", quote: "q2", comment: "c", start: 3, end: 5, verified: true, locateMethod: "exact" },
+  { id: "e3", dimension: "organization", kind: "minor", quote: "q3", comment: "c", start: 6, end: 8, verified: true, locateMethod: "exact" },
+];
+
+// 这一条 fixture 一次覆盖四种丢弃路径：非法 focus、重复 focus、空 reason、超上限
+const trained = __internals.parseTrainingPlan(
+  [
+    { focus: "tense", reason: "全文 6 处时态来回跳" },
+    { focus: "TENSE", reason: "重复类别，应被去重" },
+    { focus: "spelling", reason: "反复拼错 accommodate" },
+    { focus: "grammar", reason: "自造类别，整条应被丢弃" },
+    { focus: "chinglish", reason: "   " },
+    { focus: "cohesion", reason: "段落之间没有过渡" },
+    { focus: "paragraphing", reason: "第 4 条，应被上限截掉" },
+  ],
+  TRAIN_EVIDENCE,
+);
+eq("非法 focus / 空 reason 丢弃、重复去重、超出上限截断", trained.length, 3);
+eq("留下的是最先出现的 3 条", trained.map((t) => t.focus), ["tense", "spelling", "cohesion"]);
+eq("去重保留的是第一条", trained[0].reason, "全文 6 处时态来回跳");
+
+// 模型没给关联证据 → 按 focus 对应的维度自动挂（照抄 parseUpgradePlan 的做法）
+check("language 类自动挂上 language 的证据", trained[0].linkedEvidenceIds.includes("e1"), trained[0]);
+check("language 类不会挂上 organization 的证据", !trained[0].linkedEvidenceIds.includes("e3"), trained[0]);
+check("cohesion 挂的是 organization 的证据", trained[2].linkedEvidenceIds.includes("e3"), trained[2]);
+
+// 模型给了就用模型的，但不存在的 id 一律剔除——否则卡片上会出现点了没反应的死链
+const explicitLinked = __internals.parseTrainingPlan(
+  [{ focus: "tense", reason: "r", linkedEvidenceIds: ["e2", "e999", 42] }],
+  TRAIN_EVIDENCE,
+);
+eq("只保留真实存在的证据 id", explicitLinked[0].linkedEvidenceIds, ["e2"]);
+
+// 整节消失是**正常降级**，不是故障：不显示空壳，也不报 warning
+eq("全非法 → 空数组", __internals.parseTrainingPlan([{ focus: "grammar", reason: "r" }], TRAIN_EVIDENCE), []);
+eq("不是数组 → 空数组", __internals.parseTrainingPlan("nope", TRAIN_EVIDENCE), []);
+eq("undefined → 空数组", __internals.parseTrainingPlan(undefined, TRAIN_EVIDENCE), []);
+eq("空数组 → 空数组", __internals.parseTrainingPlan([], TRAIN_EVIDENCE), []);
+
+// --- coerceExample：把"敷衍的示范"挡在门外 -----------------------------------
+eq(
+  "正常示范原样通过",
+  coerceExample({ before: "he go", after: "he goes" }),
+  { before: "he go", after: "he goes" },
+);
+eq(
+  "两端空白被清掉",
+  coerceExample({ before: "  he go  ", after: "  he goes  " }),
+  { before: "he go", after: "he goes" },
+);
+// before === after 是最容易漏过去的一种敷衍：字段齐全、格式合法、报告上看起来
+// 和正常示范一模一样，但学生照着看什么也学不到。必须当成"没给"处理。
+eq("before 与 after 相同 → 无效", coerceExample({ before: "he go", after: "he go" }), undefined);
+eq("缺 after → 无效", coerceExample({ before: "he go" }), undefined);
+eq("缺 before → 无效", coerceExample({ after: "he goes" }), undefined);
+eq("全是空白 → 无效", coerceExample({ before: "   ", after: "  " }), undefined);
+eq("非字符串 → 无效", coerceExample({ before: 1, after: 2 }), undefined);
+eq("null → 无效", coerceExample(null), undefined);
+eq("字符串 → 无效", coerceExample("he go"), undefined);
+eq("数组 → 无效", coerceExample([]), undefined);
+// 长度护栏放在这里而不是 locateExampleQuote：这是纯函数，能被断言。
+// 模型偶尔会把整段贴进 before，而模糊定位是平方量级。
+eq(
+  "before 超过 MAX_QUOTE_CHARS → 无效",
+  coerceExample({ before: "x".repeat(MAX_QUOTE_CHARS + 1), after: "y" }),
+  undefined,
+);
+check(
+  "刚好等于 MAX_QUOTE_CHARS 仍然有效",
+  coerceExample({ before: "x".repeat(MAX_QUOTE_CHARS), after: "y" }) !== undefined,
+);
+
+// --- locateExampleQuote：本轮最关键的判定 ------------------------------------
+//
+// ⚠️ 判定必须是 exact | normalized，**不能退到 fuzzy**。locateQuote 会一路退到
+// fuzzyLocate，它的阈值是词重叠 ≥80%——对短句来说 3 个词里中 3 个就算命中，
+// 于是模型编的 "I very like"（原文是 "I like very much"）会被判成"已验证"，
+// 正好是这个功能要抓的那种编造。下面两条断言就是防止有人日后把它改回
+// `method !== "none"` 的护栏——**删掉它们之前先想清楚代价**。
+const EX_ESSAY = "I like very much the sports which are played in the playground.";
+check("逐字命中 → 通过", locateExampleQuote(EX_ESSAY, "which are played"));
+check("仅大小写差异 → 通过", locateExampleQuote(EX_ESSAY, "Which Are Played"));
+check("仅空白差异 → 通过", locateExampleQuote(EX_ESSAY, "which  are   played"));
+check("原文里没有 → 不通过", !locateExampleQuote(EX_ESSAY, "completely absent phrase"));
+check("空 before → 不通过", !locateExampleQuote(EX_ESSAY, ""));
+check("空原文 → 不通过", !locateExampleQuote("", "which are played"));
+check(
+  "⚠️ 词重叠 ≥80% 但不是原文（编造的示范）→ 不通过",
+  !locateExampleQuote(EX_ESSAY, "I very like"),
+);
+check(
+  "⚠️ 只有零散词重合 → 不通过",
+  !locateExampleQuote(EX_ESSAY, "playground playing plays"),
 );
 
 // ---------------------------------------------------------------------------
@@ -411,6 +860,48 @@ const oob = segmentEssay(HL_ESSAY, [
 ]);
 eq("越界区间被丢弃", oob.length, 1);
 eq("越界时不产生高亮", oob[0].kind, null);
+
+// --- 证据卡片 ←→ 原文高亮的锚点映射 -----------------------------------------
+//
+// 这一组盯的是一个很安静的错误：重叠的证据会被合并进**同一个** <mark>，
+// 而一个元素只能有一个 id（用合并块里的第一条证据）。第二条证据的卡片要是
+// 自己拼 `anchor-${自己}`，就会指向一个不存在的元素——点下去毫无反应，也不报错。
+console.log("\n[6b] 锚点映射");
+
+const OVERLAP_ESSAY = "AAA BBB CCC DDD EEE";
+const OVERLAP_EVIDENCE: Evidence[] = [
+  { id: "e1", dimension: "language", kind: "minor", quote: "AAA BB", comment: "", start: 0, end: 6, verified: true, locateMethod: "exact" },
+  { id: "e2", dimension: "language", kind: "major", quote: "BBB", comment: "", start: 4, end: 7, verified: true, locateMethod: "exact" },
+  { id: "e3", dimension: "content", kind: "strength", quote: "DDD", comment: "", start: 12, end: 15, verified: true, locateMethod: "exact" },
+  { id: "e4", dimension: "language", kind: "minor", quote: "找不到的引文", comment: "", start: null, end: null, verified: false, locateMethod: "none" },
+  { id: "e5", dimension: "language", kind: "minor", quote: "越界", comment: "", start: 80, end: 99, verified: true, locateMethod: "exact" },
+];
+const anchors = anchorMap(OVERLAP_ESSAY, OVERLAP_EVIDENCE);
+
+eq("块首证据指向自己", anchors.get("e1"), "anchor-e1");
+// ★ 这条是整个功能的立足点：重叠的第二条必须被引到块首
+eq("重叠的第二条证据被引到块首", anchors.get("e2"), "anchor-e1");
+eq("不重叠的证据指向自己", anchors.get("e3"), "anchor-e3");
+check("没定位到的证据不在表里", !anchors.has("e4"));
+// 越界的证据不会被画出高亮（见上面那条断言），所以也不该有锚点可跳——
+// 否则卡片上的链接会指向一个不存在的 id
+check("越界的证据不在表里", !anchors.has("e5"));
+
+// 映射必须和真正渲染出来的 <mark> 对得上：表里每个值都得是个真实存在的锚点。
+// 这一条是防"以后有人改了一处忘了另一处"的兜底
+const renderedAnchors = new Set(
+  segmentEssay(OVERLAP_ESSAY, OVERLAP_EVIDENCE)
+    .filter((s) => s.kind && s.ids.length > 0)
+    .map((s) => `${ANCHOR_PREFIX}${s.ids[0]}`),
+);
+const dangling = [...anchors.values()].filter((a) => !renderedAnchors.has(a));
+eq("映射里没有指向不存在元素的死链", dangling, []);
+check("每条被映射的证据都真的画出了高亮", anchors.size === 3);
+
+// 没有证据时不该凭空造出锚点
+eq("无证据时映射为空", anchorMap(HL_ESSAY, []).size, 0);
+// 原文为空时也不该炸
+eq("空原文 + 空证据仍为空映射", anchorMap("", []).size, 0);
 
 // ---------------------------------------------------------------------------
 console.log("\n[7] HTML 转义（XSS）");
@@ -471,6 +962,27 @@ const mockResult: ReviewResult = {
       example: { before: "a student want", after: "a student wants" },
       linkedEvidenceIds: ["e1"],
     },
+    {
+      priority: 2, dimension: "language",
+      action: "把时态统一成一般现在时",
+      rationale: "时态来回跳属于严重错误",
+      exampleUnverified: true,
+      example: { before: "这句原文里根本没有", after: "改后的版本" },
+      linkedEvidenceIds: [],
+    },
+    {
+      priority: 3, dimension: "organization",
+      action: "把第 2 段之后另起一段",
+      rationale: "全文只有一段，结构分上不去",
+      exampleMissing: true,
+      linkedEvidenceIds: [],
+    },
+  ],
+  // 训练区。reason 里塞一段 <script>——`[8]` 那几条"零 JS"断言原先只被 essay
+  // 覆盖，加上这一条之后，练法卡片的转义路径也被同一批断言看着了。
+  trainingPlan: [
+    { focus: "agreement", reason: "全文 4 处第三人称单数漏 s", linkedEvidenceIds: ["e1"] },
+    { focus: "paragraphing", reason: '整篇挤成一段<script>alert("train")</script>', linkedEvidenceIds: [] },
   ],
   stats: {
     wordCount: 20, sentenceCount: 2, paragraphCount: 1,
@@ -494,6 +1006,69 @@ check("报告与网页用的是同一份标签文案", METHOD_LABEL.none === "�
 check("报告包含改写示范", html.includes("a student wants"));
 check("报告包含证据锚点", html.includes('id="card-e1"'));
 check("报告样式内联、不引用外部资源", !html.includes("<link") && !html.includes("http://"));
+
+// --- 报告必须是"零 JS"的 ----------------------------------------------------
+//
+// 这份 HTML 会被双击打开、发给老师、打印成 PDF，还可能落在禁用脚本的环境里
+// （邮件客户端预览、某些 PDF 阅读器）。所以**双向跳转只能靠朴素锚点 + CSS :target**，
+// 一旦有人为了省事加一行内联 onclick，整条交互就会在那些环境里静默失效。
+// 以前这块一条测试都没有，改 U4 的时候很容易手滑。
+check("报告不含 script 标签", !html.includes("<script"), html.slice(0, 200));
+check("报告不含内联事件处理器", !/\son[a-z]+\s*=/i.test(html));
+check("报告不引用 https 外部资源", !html.includes("https://"));
+check("报告不含 iframe / object / embed", !/<(iframe|object|embed)\b/i.test(html));
+
+// 两个方向都得有链接，而且必须指向真实存在的 id
+check("高亮块指回证据卡片", html.includes('href="#card-e1"'));
+check("证据卡片的坐标指回原文高亮", html.includes('href="#anchor-e1"'));
+check(
+  "两个方向的锚点 id 都真实存在",
+  html.includes('id="anchor-e1"') && html.includes('id="card-e1"'),
+);
+
+// 未定位的证据**不能**有指回原文的链接——那是个点了没反应的死链。
+// e2 的坐标是 null，所以它的卡片里只能有那个标红的"未能在原文中定位"
+check(
+  "未定位的证据不做成链接",
+  html.includes(`id="card-e2"`) && !html.includes('href="#anchor-e2"'),
+);
+
+// --- 训练区 ----------------------------------------------------------------
+check("报告里有训练区标题", html.includes("<h2>训练区</h2>"));
+// 用 chip 的完整标记来断言，不用裸标签文本：证据的 comment 里也有"主谓不一致"，
+// 裸文本断言会被它蒙混过关
+check("训练项用的是标签表里的文案", html.includes('class="chip chip-solid">主谓一致<'));
+check("第二类训练项也在（没被吞掉）", html.includes('class="chip chip-solid">分段<'));
+// 通用练法与"针对本篇的诊断"必须能区分，否则学生会把通用建议当成对自己的判断
+check("通用练法带上了「不是针对你这一篇」的说明", html.includes("不是针对你这一篇写的"));
+check("练法列出了「写作时怎么做」", html.includes("写作时怎么做"));
+check("练法列出了「平时怎么练」", html.includes("平时怎么练"));
+check("每类练法都带 watchOut", html.includes("<strong>当心：</strong>"));
+check("训练项链到了真实证据锚点", html.includes('id="card-e1"'));
+
+// 两类"示范有问题"的提示必须都渲染出来——它们是这个功能的可见面，
+// 只在数据里打标记而在报告上不显示，等于没做
+check("标出了没能定位的示范", html.includes("模型可能自己造了句子"));
+check("没给示范的那条说明了原因", html.includes("条没有改写示范"));
+
+// 导出 PDF 时卡片被切到两页上很难看。report-html.ts **自带一份** @media print，
+// 和 app/globals.css 里那份是两处，漏改一边就是这个下场。
+check(
+  "导出 CSS 的打印白名单里也加了 .train-card",
+  /@media print[\s\S]*?train-card/.test(html),
+);
+
+// 老报告（升级前存下的）根本没有这个键。lib/store.ts 是盲 as ReviewResult，
+// 这里 delete 掉模拟的正是那种数据——守卫写漏了会整页崩，不是少显示一节。
+const noTraining = { ...mockResult };
+delete noTraining.trainingPlan;
+const htmlNoTraining = buildReportHtml(noTraining);
+check("没有训练数据时不渲染训练区", !htmlNoTraining.includes("<h2>训练区</h2>"));
+// 断言的是**元素标记**而不是裸类名：REPORT_CSS 里永远有 `.train-card`
+// 这条规则（样式是静态的），拿裸类名做断言会恒为假
+check("没有训练数据时不留空壳", !htmlNoTraining.includes('class="card train-card"'));
+const htmlEmptyTraining = buildReportHtml({ ...mockResult, trainingPlan: [] });
+check("训练项为空数组时同样整节消失", !htmlEmptyTraining.includes("<h2>训练区</h2>"));
 
 // ---------------------------------------------------------------------------
 console.log("\n[9] 访问口令");
@@ -551,6 +1126,166 @@ console.log("\n[9] 访问口令");
   eq("裁剪后能匹配", verifyAccessCode("padded-code"), { ok: true });
 
   setCode(originalCode);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[9b] 作文草稿的收拢与判定");
+
+{
+  const EMPTY = { essay: "", topic: "", targetBandLevel: "" };
+
+  // 入参是 JSON.parse 的结果，所以必须经得住任何东西——包括根本不是对象的
+  eq("null → 空草稿", coerceDraft(null), EMPTY);
+  eq("undefined → 空草稿", coerceDraft(undefined), EMPTY);
+  eq("字符串 → 空草稿", coerceDraft("a whole essay"), EMPTY);
+  eq("数字 → 空草稿", coerceDraft(42), EMPTY);
+  eq("布尔 → 空草稿", coerceDraft(true), EMPTY);
+  // 数组也是 object，但绝不能被当成草稿去取 essay 字段
+  eq("数组 → 空草稿", coerceDraft([1, 2, 3]), EMPTY);
+
+  // 缺字段要补空，而不是整体丢弃：宁可恢复出一篇缺题的作文，也不能把正文弄丢
+  eq("只有 essay → 其余补空", coerceDraft({ essay: "hello" }), {
+    essay: "hello",
+    topic: "",
+    targetBandLevel: "",
+  });
+  // 类型不对的字段单独降级，不连累其他字段
+  eq("字段类型不对 → 该字段降级，其余保留", coerceDraft({
+    essay: "hello",
+    topic: 123,
+    targetBandLevel: null,
+  }), { essay: "hello", topic: "", targetBandLevel: "" });
+  // targetBandLevel 在表单里是 select 的字符串值。旧版本若存成数字，
+  // 直接塞回受控 select 会让 React 抱怨 value 不在选项里，所以这里必须归成字符串
+  eq("数字形式的档位不算数", coerceDraft({ essay: "hi", targetBandLevel: 3 }), {
+    essay: "hi",
+    topic: "",
+    targetBandLevel: "",
+  });
+
+  // 正常值要原样带过来，一个字符都不能动（作文里的换行、标点都得留着）
+  const full = { essay: "line1\nline2  ", topic: "My view on...", targetBandLevel: "6" };
+  eq("完整草稿原样保留", coerceDraft(full), full);
+
+  // 空判定
+  check("三个空字符串 → 空", isDraftEmpty(EMPTY));
+  check("纯空白 → 空", isDraftEmpty({ essay: "  \n\t ", topic: "", targetBandLevel: " " }));
+  check("只有正文 → 非空", !isDraftEmpty({ essay: "a", topic: "", targetBandLevel: "" }));
+  // 只写了题目也值得留：学生往往是先想好题目再动手
+  check("只有题目 → 非空", !isDraftEmpty({ essay: "", topic: "t", targetBandLevel: "" }));
+  check("只有档位 → 非空", !isDraftEmpty({ essay: "", topic: "", targetBandLevel: "6" }));
+
+  // 收拢之后判空：坏数据要一路走到「没有草稿」，而不是恢复出一个空壳
+  check("坏数据收拢后为空", isDraftEmpty(coerceDraft({ nope: 1 })));
+
+  // SSR / Node 下没有 localStorage。这几个函数必须安静地退化成空操作，
+  // 因为 lib/store.ts 是被客户端组件导入的，构建时会在服务端执行到它们
+  check("Node 下 loadDraft() 返回 null 而不是抛异常", loadDraft() === null);
+  let threw = false;
+  try {
+    saveDraft({ essay: "x", topic: "", targetBandLevel: "" });
+  } catch {
+    threw = true;
+  }
+  check("Node 下 saveDraft() 静默无操作", !threw);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[9c] 报告的新鲜度");
+
+{
+  // 固定一个「现在」，避免断言依赖真实时钟
+  const NOW = Date.UTC(2026, 8, 21, 12, 0, 0);
+  const ago = (ms: number) => new Date(NOW - ms).toISOString();
+
+  check("刚生成的算新鲜", isResultFresh(ago(0), NOW));
+  check("一小时前算新鲜", isResultFresh(ago(60 * 60 * 1000), NOW));
+  check(
+    "差一点到 24 小时仍算新鲜",
+    isResultFresh(ago(RESULT_FRESH_MS - 1000), NOW),
+  );
+  // 边界取"严格小于"：正好 24 小时算旧的。差一毫秒的事，方向取安全的那边
+  check("正好 24 小时算旧", !isResultFresh(ago(RESULT_FRESH_MS), NOW));
+  check("25 小时前算旧", !isResultFresh(ago(25 * 60 * 60 * 1000), NOW));
+  check("一个月前算旧", !isResultFresh(ago(30 * 24 * 60 * 60 * 1000), NOW));
+
+  // 解析不出来的值一律当旧的。这个方向的失败只是多显示一句生成时间，
+  // 反过来会让一份放了半年的报告装成刚出炉的——所以这里必须偏保守
+  check("空字符串算旧", !isResultFresh("", NOW));
+  check("乱码算旧", !isResultFresh("not a date", NOW));
+  check("null 字符串算旧", !isResultFresh("null", NOW));
+  // 注意 Date.parse("1700000000000") 是 NaN（纯数字当不了日期），别指望它能通过
+  check("裸数字字符串算旧", !isResultFresh(String(NOW), NOW));
+
+  // 时钟偏了（客户端时间比服务端生成的时刻早）不该被误判成旧报告
+  check("时间戳在未来算新鲜", isResultFresh(ago(-60 * 1000), NOW));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n[9d] 客户端读超时");
+
+{
+  // 分段的依据是「收到过第一个字节没有」，不是什么别的东西
+  eq("收到过字节 → streaming", readPhase(true), "streaming");
+  eq("没收到 → waiting-first-frame", readPhase(false), "waiting-first-frame");
+
+  // ⚠️ 下面两条在和**服务端**的超时赛跑，数字是硬约定：
+  //    · 首帧阈值必须大于 REVIEW_TIMEOUT_MS 的默认值（100 秒）——这一段没有存活
+  //      信号可用，只能等服务端自己的总预算走完，抢在它前面判死就是误杀
+  //    · 停滞阈值必须大于 REVIEW_STALL_MS 的默认值（30 秒）——否则服务端那条
+  //      具体的「上游停滞」报错会被我们这句笼统的「连接中断」盖掉
+  // 改 lib/deepseek.ts 里那两个默认值的时候，这里会红，跟着一起改
+  check(
+    "首帧阈值留出了服务端总预算（100 秒）",
+    deadlineFor("waiting-first-frame") > 100_000,
+    deadlineFor("waiting-first-frame"),
+  );
+  check(
+    "停滞阈值留出了服务端的停滞超时（30 秒）",
+    deadlineFor("streaming") > 30_000,
+    deadlineFor("streaming"),
+  );
+  check(
+    "首帧阈值更宽松（那一段沉默是正常的）",
+    FIRST_FRAME_DEADLINE_MS > STREAM_STALL_DEADLINE_MS,
+  );
+  check("两个阈值都是有限正数", Number.isFinite(deadlineFor("streaming")) && STREAM_STALL_DEADLINE_MS > 0);
+
+  // 提示的"不哭狼"边界。这条最容易在改动里被手滑破坏
+  check("沉默 0 秒不提示", silenceHint("streaming", 0) === null);
+  check(
+    `沉默 ${SILENCE_HINT_SECONDS - 1} 秒仍不提示`,
+    silenceHint("streaming", SILENCE_HINT_SECONDS - 1) === null,
+  );
+  // 阈值一到就得说。这里用"大于等于"而不是"大于"，卡在整秒上的判断更符合直觉
+  eq("沉默到阈值就提示", silenceHint("streaming", SILENCE_HINT_SECONDS), {
+    phase: "streaming",
+    seconds: SILENCE_HINT_SECONDS,
+  });
+  // 首帧之前也要提示——这正是 U2 修的硬伤：门槛挂错在 chars > 0 上，
+  // 断在首帧之前时一句话都不说
+  eq("首帧之前同样会提示", silenceHint("waiting-first-frame", 45), {
+    phase: "waiting-first-frame",
+    seconds: 45,
+  });
+  // 算不出来的时候宁可不说，也不能显示 "NaN 秒"
+  check("NaN 秒不提示", silenceHint("streaming", Number.NaN) === null);
+  check("Infinity 秒不提示", silenceHint("streaming", Number.POSITIVE_INFINITY) === null);
+  check("负秒数不提示", silenceHint("streaming", -5) === null);
+  eq("秒数向下取整", silenceHint("streaming", 45.87)?.seconds, 45);
+
+  // 两段的文案必须不一样：原因不同，用户能做的事也不同
+  const waitMsg = deadlineMessage("waiting-first-frame");
+  const streamMsg = deadlineMessage("streaming");
+  check("两段的超时文案不同", waitMsg !== streamMsg);
+  check("首帧超时文案带上阈值秒数", waitMsg.includes(String(FIRST_FRAME_DEADLINE_MS / 1000)));
+  check("停滞超时文案带上阈值秒数", streamMsg.includes(String(STREAM_STALL_DEADLINE_MS / 1000)));
+  // 首帧那条要提到"重试"，因为上游排队重试一次通常就好
+  check("首帧超时文案提示重试", waitMsg.includes("重试"));
+
+  // 错误代号：中途断连是链路问题，不能和服务端的 TIMEOUT 混为一谈
+  eq("首帧超时用 TIMEOUT（原因在服务端/上游）", deadlineCode("waiting-first-frame"), "TIMEOUT");
+  eq("中途断连用 CONNECTION_LOST", deadlineCode("streaming"), "CONNECTION_LOST");
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1800,34 @@ async function runRateLimitTests(): Promise<void> {
     logged,
   );
 
+  // ---- fallback 的清理不能漏 ----------------------------------------------
+  // withFallback.sweep() 原来只调 primary.sweep()，fallback 的 sweep **从来没被
+  // 调用过**。后果不是"稍微脏一点"：降级期间写进内存 Map 的条目永远没人清，
+  // DB 挂着时来一波伪造 IP 就一个假 IP 一条，只增不减 → OOM；而 DB 恢复之后更糟，
+  // 那时 primary 每次都成功、catch 分支再也进不去，长驻进程（next start 自托管，
+  // 不像 serverless 会随实例回收）里这些条目要留到进程重启。
+  //
+  // 用替身而不是拿真的内存 store 观察：Map 是闭包私有的，从外面只能间接推断，
+  // 而"fallback.sweep 到底有没有被调到"本身就是要断言的那件事。
+  let fallbackSweeps = 0;
+  const spyFallback = {
+    policy,
+    peek: () => fallback.peek("spy"),
+    recordFailure: async () => ({ failCount: 0, lockRetryAfterMs: 0 }),
+    recordSuccess: async () => ({ windowCount: 0, windowResetAfterMs: 0 }),
+    sweep: async () => {
+      fallbackSweeps += 1;
+    },
+  };
+
+  await withFallback(broken, spyFallback).sweep();
+  eq("降级：primary.sweep() 抛异常时仍然扫了 fallback", fallbackSweeps, 1);
+
+  // 反向同样要成立。只在 catch 里扫是不够的：降级期的残留条目要等 DB 恢复后才清，
+  // 而那时恰恰进不去 catch——"失败时才扫"实际等于"永远不扫"。
+  await withFallback({ ...broken, sweep: async () => undefined }, spyFallback).sweep();
+  eq("降级：primary.sweep() 成功时同样扫 fallback", fallbackSweeps, 2);
+
   // 同一条告警不能刷屏：60 秒内的重复故障要折叠
   const before = logged.length;
   const originalError2 = console.error;
@@ -1127,6 +1890,81 @@ async function runRateLimitTests(): Promise<void> {
   );
   eq("回落到 x-real-ip", clientKeyFrom(reqWith({ "x-real-ip": "9.9.9.9" })), "9.9.9.9");
   eq("都没有时用固定 key（宁可共用配额也不放过）", clientKeyFrom(reqWith({})), "unknown");
+
+  // ---- 口令失败的统一处置 -------------------------------------------------
+  // 这一段被**两条**路由共用（批改 /api/review + 口令页 /api/access），坏了是同时
+  // 坏两条，其中一条是"口令页变成无限次猜口令机"。lib/access-gate.ts 刻意不 import
+  // next/server、只返回纯数据，正是为了能在这儿用一个假 gate 直接断言它。
+
+  // humanizeWait：这个数会原样出现在给用户看的文案里（「请 X 后再试」）。
+  // 一律向上取整是刻意的——少报一秒，用户就会提前重试、又撞上一次锁。
+  eq("不足 1 秒也报 1 秒（不能报「请 0 秒后再试」）", humanizeWait(1), "1 秒");
+  eq("1.5 秒向上取整成 2 秒（截断成 1 就少报了）", humanizeWait(1500), "2 秒");
+  // 分档用的是**取整后**的秒数，所以切换点在 59.001 秒而不是 60 秒。这个偏移方向
+  // 是安全的：宁可说「1 分钟」让用户多等半秒，也不能说「59 秒」让他早 1 秒回来撞锁
+  eq("59 秒整还是 59 秒", humanizeWait(59_000), "59 秒");
+  eq("59.001 秒已取整到 60 秒，于是报 1 分钟（多报不会害人）", humanizeWait(59_001), "1 分钟");
+  eq("一分钟整起改按分钟报", humanizeWait(FAIL_TIER1_LOCK_SECS * 1000), "1 分钟");
+  // 用常量而不是字面量 300000：改了档位这条会跟着走，不然就成了摆设
+  eq("最高档的锁报成 5 分钟", humanizeWait(FAIL_TIER2_LOCK_SECS * 1000), "5 分钟");
+  // ⚠️ 这里**不**断言 humanizeWait(0)：那个分支不可达——两条路由都在
+  // lockedForMs > 0 时才拿它拼文案。真为它写一条断言，等于把「请 0 秒后再试」
+  // 钉成了预期行为
+
+  // 假 gate 只做两件事：记下 key、回一个"这一次刚好锁上"的时长。
+  // 用替身而不是真的内存 store，是因为要断言的是「拖慢到底有没有发生」（时序），
+  // 而挂在 store 上是观察不到的。
+  const gateWith = (failDelayMs: number) => {
+    const seen = { key: null as string | null, calls: 0 };
+    const gate: RateLimitGate = {
+      policy: { ...policy, failDelayMs },
+      peek: async () => ({ lockRetryAfterMs: 0, windowCount: 0, windowResetAfterMs: 0 }),
+      recordFailure: async (key: string) => {
+        seen.key = key;
+        seen.calls += 1;
+        return { failCount: FAIL_TIER1_COUNT, lockRetryAfterMs: 61_000 };
+      },
+      recordSuccess: async () => ({ windowCount: 0, windowResetAfterMs: 0 }),
+      sweep: async () => undefined,
+    };
+    return { gate, seen };
+  };
+
+  const { gate: quickGate, seen: quickSeen } = gateWith(0);
+  const quickAt = Date.now();
+  const penalized = await penalizeAccessFailure(quickGate, "1.2.3.4");
+  eq('把「这一次刚好锁上」的时长原样交回去（丢了它，被锁的人只会看到笼统的 401）', penalized.lockedForMs, 61_000);
+  eq("失败记在**这个** key 上（记错 key = 换个 IP 就绕开）", quickSeen.key, "1.2.3.4");
+  // 一次失败记两笔，等于档位翻倍地涨：正常手滑两下就被锁
+  eq("一次失败只记一笔", quickSeen.calls, 1);
+  check("failDelayMs 为 0 时真的一下都不等", Date.now() - quickAt < 150, { 耗时: Date.now() - quickAt });
+
+  const { gate: slowGate } = gateWith(50);
+  const slowAt = Date.now();
+  await penalizeAccessFailure(slowGate, "1.2.3.4");
+  // 容 5ms：setTimeout 不会早于 50ms 触发，但 Date.now() 是毫秒截断的
+  check("配了拖慢就真的等那一下（这是串行爆破的成本）", Date.now() - slowAt >= 45, { 耗时: Date.now() - slowAt });
+
+  // 两条锁定文案必须是**两句不同的话**：分开写就是为了让"你刚输的那一下正好是第 7 次"
+  // 能当场说出来，而不是让用户以为又打错了、再撞一次才被告知被锁（那次又是几十秒）
+  check("锁定文案≠刚被锁上的文案", lockedMessage(60_000) !== lockedAfterFailureMessage(60_000));
+  check(
+    "刚被锁上时：既说了口令不正确，也说了已锁定",
+    /不正确/.test(lockedAfterFailureMessage(60_000)) && /已锁定/.test(lockedAfterFailureMessage(60_000)),
+    { lockedAfterFailureMessage: lockedAfterFailureMessage(60_000) },
+  );
+  // 注意这里用 /锁定/ 而不是 /已锁定/：早拒那句写的是「已**暂时**锁定」。
+  // 两句话用词不同是有意的——早拒是"等一会儿就行"，刚被锁上是"你错了，而且现在要等"
+  check(
+    '早拒时**不提**「口令不正确」（那一下根本没验口令，说了是误导）',
+    !/不正确/.test(lockedMessage(60_000)) && /锁定/.test(lockedMessage(60_000)),
+    { lockedMessage: lockedMessage(60_000) },
+  );
+  // 文案要能直接指导站长动手，否则他只知道"功能不可用"
+  check("缺配置的文案点名了要设哪个环境变量", MISSING_CONFIG_MESSAGE.includes("REVIEW_ACCESS_CODE"));
+  // 没到档就说"被锁定"是另一种误导：用户会以为账号被拉黑了，去翻根本不存在的黑名单。
+  // （"缺配置 vs 口令不对"那对不用比——两条是各自写死的常量，类型系统已经保证不等）
+  check("只是这一下错了，不提锁定", !/锁定/.test(ACCESS_DENIED_MESSAGE), { ACCESS_DENIED_MESSAGE });
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,6 +2012,14 @@ async function runE2E() {
       { priority: 2, dimension: "language", action: "固定搭配与介词", rationale: "r" },
       { priority: 3, dimension: "content", action: "补一个具体经历", rationale: "r" },
     ],
+    // 训练区走**完整管线**（assembleResult）而不是单测 parser。
+    // 三条里故意混进一个自造类别和一个大小写不规范的写法：
+    // 前者整条丢弃、后者归一后收下，这两个行为只有在端到端才看得出是同一件事。
+    trainingPlan: [
+      { focus: "agreement", reason: "全文 4 处第三人称单数漏 s" },
+      { focus: "SPELLING", reason: "同一篇里拼法不统一" },
+      { focus: "grammar", reason: "自造类别，应被整条丢弃" },
+    ],
   };
 
   const originalFetch = globalThis.fetch;
@@ -1193,6 +2039,31 @@ async function runE2E() {
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
   }) as typeof fetch;
+
+  /**
+   * 换一份模型输出（或换一篇作文）再跑一次批改。
+   *
+   * 判分链路上的每个兜底都只在"模型没规矩"时才生效，而上面那份 fixture 是
+   * 一切都规规矩矩的样子——拿它测不出任何兜底。所以下面几组断言各自换一份
+   * 病态输出重跑一遍，跑的还是同一条 reviewEssay 全链路（不是单测某个函数），
+   * 这样"校验算对了"和"警告真的发出去了"是同一件事。
+   */
+  const reviewWith = async (
+    output: Record<string, unknown>,
+    essay: string = E2E_ESSAY,
+  ): Promise<ReviewResult> => {
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({ choices: [{ message: { content: JSON.stringify(output) } }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as typeof fetch;
+    try {
+      return await reviewEssay({ essay, topic: "apply for a volunteer program" });
+    } finally {
+      globalThis.fetch = previous;
+    }
+  };
 
   try {
     const result = await reviewEssay({
@@ -1229,6 +2100,35 @@ async function runE2E() {
     );
     check("升档建议的关联证据优先挂严重错误", langPlan.linkedEvidenceIds.includes("e1"), langPlan.linkedEvidenceIds);
 
+    // --- 训练区（走的是完整管线，不是单元测 parser）------------------------
+    eq("训练项条数（自造类别被整条丢弃）", result.trainingPlan?.length, 2);
+    eq(
+      "大小写不规范的类别被归一后收下，顺序保持",
+      result.trainingPlan?.map((t) => t.focus),
+      ["agreement", "spelling"],
+    );
+    check(
+      "训练项自动关联到真实存在的同维度证据",
+      result.trainingPlan!.every(
+        (t) =>
+          t.linkedEvidenceIds.length > 0 &&
+          t.linkedEvidenceIds.every((id) => result.evidence.some((e) => e.id === id)),
+      ),
+      result.trainingPlan,
+    );
+
+    // --- 升档示范：给没给、是不是原文里的，报告上必须**看得出差别** --------
+    const examplePlan = result.upgradePlan.filter((a) => a.example);
+    eq("给了示范的建议数", examplePlan.length, 1);
+    eq("没给示范的被标出来了（3 条里 2 条没给）", result.upgradePlan.filter((a) => a.exampleMissing).length, 2);
+    check("逐字来自原文的示范不打未验证标记", !examplePlan[0].exampleUnverified, examplePlan[0]);
+    // 没给示范是正常降级，不是故障——报 warning 会把"模型这次省略了"渲染成一次失败
+    check(
+      "没给示范**不**产生 warning",
+      !result.warnings.some((w) => w.includes("改写示范")),
+      result.warnings,
+    );
+
     check("请求打到了正确的接口", captured!.url.endsWith("/chat/completions"), captured!.url);
     const sentMessages = (captured!.body.messages as Array<{ content: string }>) ?? [];
     check("system prompt 带上了档次表", sentMessages[0].content.includes("14 分档"));
@@ -1241,6 +2141,137 @@ async function runE2E() {
 
     check("meta 记录了模型名", Boolean(result.meta.model), result.meta.model);
     check("meta 记录了耗时", typeof result.meta.elapsedMs === "number");
+
+    // ---- 上面这份 fixture 是"一切都正常"的基线。下面几条钉住的是**不该出声**：
+    // 原文里没有重复引文、kind 全合法、分数是数字，所以这四项必须安静。
+    // 少了这一半，一个"永远报警"的实现也能让后面那几条变绿
+    eq("基线：没有歧义条目", result.stats.ambiguousCount, 0);
+    check(
+      "基线：没有歧义警告",
+      !result.warnings.some((w) => w.includes("不止一处")),
+      result.warnings,
+    );
+    check(
+      "基线：没有 kind 兜底的警告",
+      !result.warnings.some((w) => w.includes("严重程度字段")),
+      result.warnings,
+    );
+    check(
+      "基线：没有“总分不可用”的警告",
+      !result.warnings.some((w) => w.includes("可用的总分")),
+      result.warnings,
+    );
+
+    // ---- G1：模型把 score15 写成字符串 ----
+    // 修之前这里会得到一份**看起来完全正常、但 0 分 0 档**的报告：不报错、不告警，
+    // 因为对下游来说 0 是个合法分数。这是整轮里最值钱的一条断言
+    const withScoreString = await reviewWith({ ...fakeModelOutput, score15: "8" });
+    eq("G1：字符串分数被收下（不是 0 分）", withScoreString.score15, 8);
+    eq("G1：档次随之正确", withScoreString.band.label, "8 分档");
+    check(
+      "G1：字符串分数不算异常，不出警告",
+      !withScoreString.warnings.some((w) => w.includes("可用的总分")),
+      withScoreString.warnings,
+    );
+
+    // ---- G1：模型给了一个根本不能当分数的值 ----
+    const withBadScore = await reviewWith({ ...fakeModelOutput, score15: "八分" });
+    eq("G1：读不出来的分数落 0", withBadScore.score15, 0);
+    check(
+      "G1：读不出来的分数**必须出声**（这就是原来那条静默路径）",
+      withBadScore.warnings.some((w) => w.includes("可用的总分")),
+      withBadScore.warnings,
+    );
+    check(
+      "G1：警告里带上收到的原值，便于排查",
+      withBadScore.warnings.some((w) => w.includes("八分")),
+      withBadScore.warnings,
+    );
+
+    // ---- G2：引文在原文里出现多次 ----
+    // 造一篇"同一句话出现两次"的作文，让模型引的那句有歧义。
+    // 断言的重点不是"落在哪一处"（那只能是猜），而是这件事被说了出来，
+    // 且**没有**把 method 降级——两处都是逐字命中，降级就是假信息
+    const dupEssay = E2E_ESSAY.replace("First, I am very hardworking", "I very like help other people.");
+    const dupResult = await reviewWith({ ...fakeModelOutput, score15: 8 }, dupEssay);
+    const amb = dupResult.evidence.filter((e) => e.ambiguity === "multiple");
+    check("G2：重复出现的引文被标出多处匹配", amb.length > 0, dupResult.evidence.map((e) => [e.quote, e.ambiguity]));
+    eq("G2：被标出的那条仍然是 exact（匹配方式没有疑问）", amb[0]?.locateMethod, "exact");
+    check("G2：候选处数 ≥2", (amb[0]?.hitCount ?? 0) >= 2, amb[0]?.hitCount);
+    eq("G2：歧义计入 stats 的子计数", dupResult.stats.ambiguousCount, amb.length);
+    check(
+      "G2：歧义条目照样算“已定位”（不打破已定位/未定位的二分）",
+      amb.length > 0 && amb.every((e) => e.verified),
+      amb.map((e) => [e.id, e.verified]),
+    );
+    check(
+      "G2：出了一条歧义警告",
+      dupResult.warnings.some((w) => w.includes("不止一处")),
+      dupResult.warnings,
+    );
+
+    // ---- G4：模型给的严重程度不是三个合法值 ----
+    const withBadKind = await reviewWith({
+      ...fakeModelOutput,
+      evidence: fakeModelOutput.evidence.map((e) => ({ ...e, kind: "severe" })),
+    });
+    eq("G4：降级的条目一条不少（不是丢弃）", withBadKind.evidence.length, 6);
+    eq("G4：全部按 minor 处理", withBadKind.evidence.every((e) => e.kind === "minor"), true);
+    eq("G4：每一条都带上了标记", withBadKind.evidence.every((e) => e.kindDegraded), true);
+    check(
+      "G4：出了一条说明“严重程度没给对”的警告",
+      withBadKind.warnings.some((w) => w.includes("严重程度字段")),
+      withBadKind.warnings,
+    );
+    // 后果本身也要钉住：没有一条 major，按 major 条数算的上限规则就无从触发。
+    // 这不是要修的 bug（模型没说多重，代码没法替它猜），而是**必须被说出来**的
+    // 后果——上面那条警告就是干这个的
+    eq("G4：major 条数归零（上限规则因此无从触发）", withBadKind.evidence.filter((e) => e.kind === "major").length, 0);
+    check(
+      "G4：分数没有被上限校正（符合预期，且已经有警告说明原因）",
+      !withBadKind.warnings.some((w) => w.includes("分数已由系统校正")),
+      withBadKind.warnings,
+    );
+
+    // ---- 升档示范：编造的 before 必须被抓到 ----------------------------------
+    //
+    // "强制每条建议都给示范"这个改动有个反作用：给不出好例子时模型会**编一个**。
+    // 《强制 + 核查》才成立，所以这条测的就是核查那一半。
+    //
+    // ⚠️ before 特意选 "I like very"：原文是 "I very like help other people"，
+    // 三个词里中三个、词重叠 100%，locateQuote 会一路退到 fuzzy 并报"命中"。
+    // 只有把判定收在 exact | normalized 才抓得住它。**这条断言一旦变红，
+    // 先去看 locateExampleQuote 的判定条件是不是被改回了 `!== "none"`。**
+    const fabricated = await reviewWith({
+      ...fakeModelOutput,
+      upgradePlan: [
+        {
+          priority: 1, dimension: "language", action: "把 X 改成 Y", rationale: "r",
+          example: { before: "I like very", after: "I like ... very much" },
+        },
+        {
+          priority: 2, dimension: "language", action: "把 A 改成 B", rationale: "r",
+          example: { before: "I very like help other people.", after: "I like helping other people." },
+        },
+      ],
+    });
+    eq("编造的示范被标为未验证", fabricated.upgradePlan[0].exampleUnverified, true);
+    check(
+      "逐字来自原文的那条**没有**被误标（同一份输出里对照）",
+      !fabricated.upgradePlan[1].exampleUnverified,
+      fabricated.upgradePlan[1],
+    );
+    check(
+      "编造的示范会产出 warning（只强制不核查比不强制更糟：等于发一份假范文）",
+      fabricated.warnings.some((w) => w.includes("改写示范没能在原文中找到")),
+      fabricated.warnings,
+    );
+    // 给了示范就不该再打 exampleMissing——两个标记同时出现会让报告前后矛盾
+    check(
+      "给了示范就不再打 exampleMissing",
+      fabricated.upgradePlan.every((a) => !a.exampleMissing),
+      fabricated.upgradePlan.map((a) => [a.exampleMissing, a.exampleUnverified]),
+    );
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
@@ -1683,6 +2714,11 @@ async function runStreamParityTests(): Promise<void> {
         example: { before: "a student want", after: "a student who wants" },
       },
     ],
+    // 平价断言是 `strip(streamed)` vs `strip(plain)` 的整体比较（`strip` 里是展开），
+    // 所以只要有一条路径漏了给 trainingPlan，下面那条 eq 立刻就红。
+    // 这是本轮性价比最高的护栏——务必让这份 fixture **真的带着**这个字段，
+    // 两边都没有的话比的是"缺席 vs 缺席"，什么也测不到。
+    trainingPlan: [{ focus: "agreement", reason: "主谓不一致反复出现" }],
   });
 
   /** 调一次流式批改，只把错误码取出来（照抄 runAbortTest 的写法） */
@@ -1747,6 +2783,19 @@ async function runStreamParityTests(): Promise<void> {
       })
       .map((e) => e.type);
     eq("result 之前的帧里没有 score15 / warnings", premature, []);
+
+    // 训练区同理，但理由不同：score15/warnings 是"还没算完"，训练区是
+    // **结论**，本来就不该被逐条推——客户端也不该在等待页上给它留位置。
+    check(
+      "训练区确实随 result 帧到了（让上面的平价比较有东西可比）",
+      (streamed.trainingPlan ?? []).length > 0,
+      streamed.trainingPlan,
+    );
+    eq(
+      "result 之前的帧里没有 trainingPlan",
+      events.slice(0, -1).filter((e) => JSON.stringify(e).includes("trainingPlan")).length,
+      0,
+    );
 
     // 证据 id 是最终 id 的**前缀**——不是碰巧对上，是同一批解析结果
     const streamedIds = only(events, "evidence").map((e) => e.value.id);
@@ -1884,6 +2933,195 @@ async function runStreamParityTests(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// [13b] 上游错误与"读 body"的超时
+//
+// 这一节盯的是 chatJSON 的 `!res.ok` 分支和它周围的计时器，两者原来都是零覆盖：
+//
+//   · `!res.ok` 的响应体要读、状态码要留住。重新包装错误最容易把 status 弄丢，
+//     而丢了 status 就分不出"key 过期（401）"和"上游抖动（5xx）"——前者用户改不了
+//     但要有人去改配置，后者用户重试一次就好，两条提示必须是不一样的。
+//   · 读 body 的定时器原来挂在 fetch 的 finally 上：fetch 一 resolve（响应头到了）
+//     就 clearTimeout，而真正会挂住的是后面的 res.text()/res.json()。上游发完响应头
+//     再不吐 body 的话，REVIEW_TIMEOUT_MS 形同虚设，请求一路挂到平台 maxDuration
+//     被掐断——用户看到一条平台级报错，而额度已经烧了。
+//
+// 和 [13] 分开写是因为这里的失败模式不一样：[13] 测"谁掐的"，这里测"掐得到不到"。
+// ---------------------------------------------------------------------------
+async function runUpstreamErrorTests() {
+  console.log("\n[13b] 上游错误与读 body 超时");
+
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.DEEPSEEK_API_KEY;
+  const originalTimeout = process.env.REVIEW_TIMEOUT_MS;
+  const originalStall = process.env.REVIEW_STALL_MS;
+  process.env.DEEPSEEK_API_KEY = "sk-test-key-not-real";
+
+  /**
+   * 安全闸。这几条测的正是"会不会永远不返回"，直接 await 一旦回归就把整个自测
+   * 挂死在那儿——连是哪一条坏的都看不出来（后面的 section 一条都不会跑）。
+   * 超时就返回一个哨兵值，让断言变红、流程继续。
+   */
+  const withDeadline = <T>(p: Promise<T>, ms: number, sentinel: T): Promise<T> =>
+    Promise.race([p, new Promise<T>((resolve) => setTimeout(() => resolve(sentinel), ms))]);
+
+  /** body 永远不来的响应：响应头立刻到，字节一个也没有 */
+  const stalledBodyResponse = (contentType: string): Response => {
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        // 只在被掐断时才终结这个流——这正是真实上游停住时的样子：
+        // 没有数据、没有结束帧，等到我们 abort 才动
+        fetchSignals[fetchSignals.length - 1]?.addEventListener(
+          "abort",
+          () => c.error(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true },
+        );
+      },
+    });
+    return new Response(body, { status: 200, headers: { "Content-Type": contentType } });
+  };
+
+  /** 每次 fetch 收到的 signal，供上面那个流去接中止 */
+  const fetchSignals: AbortSignal[] = [];
+
+  try {
+    // ① 401：状态码要留住，文案要走"鉴权失败"那条——那条提示才指得动用户/运维
+    //    去查 DEEPSEEK_API_KEY
+    globalThis.fetch = (async () =>
+      new Response('{"error":{"message":"invalid api key"}}', {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      })) as typeof fetch;
+    const unauth = await withDeadline(
+      chatJSON<Record<string, unknown>>({ system: "s", user: "u" }).then(
+        () => null,
+        (e: unknown) => e as LLMError,
+      ),
+      2000,
+      null,
+    );
+    eq("上游 401 → UPSTREAM_ERROR", unauth?.code, "UPSTREAM_ERROR");
+    eq("上游 401 → 状态码没有被重新包装时丢掉", unauth?.status, 401);
+    check(
+      "上游 401 → 文案指向鉴权（而不是笼统的“稍后重试”）",
+      (unauth?.message ?? "").includes("鉴权失败"),
+      unauth?.message,
+    );
+
+    // ② 500：同样留住状态码，但**不能**复用 401 那句——500 不是 key 的问题，
+    //    让用户去翻自己的配置是白费功夫
+    globalThis.fetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
+    const boom = await withDeadline(
+      chatJSON<Record<string, unknown>>({ system: "s", user: "u" }).then(
+        () => null,
+        (e: unknown) => e as LLMError,
+      ),
+      2000,
+      null,
+    );
+    eq("上游 500 → UPSTREAM_ERROR", boom?.code, "UPSTREAM_ERROR");
+    eq("上游 500 → 状态码同样留住", boom?.status, 500);
+    check("上游 500 不复用 401 的鉴权文案", !(boom?.message ?? "").includes("鉴权失败"), boom?.message);
+
+    // ③ 2xx 但响应体永远不来（T1 的原场景）。断言的关键不是错误码好看，
+    //    而是**它在 REVIEW_TIMEOUT_MS 就结束了**——回归时这里会走到安全闸，
+    //    也就是"挂到平台的 120 秒上限"，那正是要修掉的行为
+    process.env.REVIEW_TIMEOUT_MS = "120";
+    globalThis.fetch = (async (_url: unknown, init: unknown) => {
+      fetchSignals.push((init as { signal: AbortSignal }).signal);
+      return stalledBodyResponse("application/json");
+    }) as typeof fetch;
+
+    const stalled = await withDeadline(
+      chatJSON<Record<string, unknown>>({ system: "s", user: "u" }).then(
+        () => null,
+        (e: unknown) => e as LLMError,
+      ),
+      3000,
+      null,
+    );
+    eq("响应头到了但 body 卡住 → 在读 body 期间超时（不是挂到平台上限）", stalled?.code, "TIMEOUT");
+    check(
+      "→ 报的是总预算那条话术，而不是被吞成“模型返回了空内容”",
+      (stalled?.message ?? "").includes("批改超时"),
+      stalled?.message,
+    );
+
+    // ④ 连接期卡住（T6 的原场景）：上游连响应头都没回。这里**不能**报
+    //    "没有返回新内容"——那是生成期的话术，此时一个字都还没轮到你读。
+    //    stall 阈值故意设得远小于预算：回归时（stall 在 fetch 之前就启动）
+    //    40ms 的 stall 会抢先掐掉，断言立刻变红
+    process.env.REVIEW_STALL_MS = "40";
+    process.env.REVIEW_TIMEOUT_MS = "120";
+    globalThis.fetch = ((_url: unknown, init: unknown) => {
+      const signal = (init as { signal?: AbortSignal }).signal;
+      return new Promise<Response>((_resolve, reject) => {
+        const bang = () => reject(new DOMException("The operation was aborted.", "AbortError"));
+        if (signal?.aborted) return bang();
+        signal?.addEventListener("abort", bang, { once: true });
+      });
+    }) as typeof fetch;
+
+    const ttfb = await withDeadline(
+      openChatStream({ system: "s", user: "u" }).then(
+        () => null,
+        (e: unknown) => e as LLMError,
+      ),
+      3000,
+      null,
+    );
+    eq("等响应头时卡住 → TIMEOUT", ttfb?.code, "TIMEOUT");
+    check(
+      "→ 报的是总预算那条，不是“没有返回新内容”（连接期不算停滞）",
+      (ttfb?.message ?? "").includes("批改超时"),
+      ttfb?.message,
+    );
+
+    // ⑤ 反向：**生成期**卡住必须仍然被 stall 掐掉，而且报的是停滞那条话术。
+    //    少了这条，把 ④ 做成"干脆不启动 stall 计时器"也能让 ④ 变绿——
+    //    那样改的话，上游开始吐字之后卡住就没人管了，一路烧到总预算
+    process.env.REVIEW_STALL_MS = "40";
+    process.env.REVIEW_TIMEOUT_MS = "5000";
+    globalThis.fetch = (async (_url: unknown, init: unknown) => {
+      fetchSignals.push((init as { signal: AbortSignal }).signal);
+      return stalledBodyResponse("text/event-stream");
+    }) as typeof fetch;
+
+    const handle = await withDeadline(
+      openChatStream({ system: "s", user: "u" }).then(
+        (h) => h,
+        () => null,
+      ),
+      3000,
+      null,
+    );
+    const stallErr = await withDeadline(
+      handle === null
+        ? Promise.resolve(null)
+        : handle.read().then(
+            () => null,
+            (e: unknown) => e as LLMError,
+          ),
+      3000,
+      null,
+    );
+    eq("响应头到了、生成期卡住 → TIMEOUT", stallErr?.code, "TIMEOUT");
+    check(
+      "→ 报的是停滞那条话术（“没有返回新内容”）",
+      (stallErr?.message ?? "").includes("没有返回新内容"),
+      stallErr?.message,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalKey;
+    if (originalTimeout === undefined) delete process.env.REVIEW_TIMEOUT_MS;
+    else process.env.REVIEW_TIMEOUT_MS = originalTimeout;
+    if (originalStall === undefined) delete process.env.REVIEW_STALL_MS;
+    else process.env.REVIEW_STALL_MS = originalStall;
+  }
+}
+
 function finish() {
   console.log(`\n${"=".repeat(46)}`);
   console.log(`通过 ${passed} 项，失败 ${failed} 项`);
@@ -1895,6 +3133,7 @@ runBodyLimitTests()
   .then(runRateLimitTests)
   .then(runE2E)
   .then(runAbortTest)
+  .then(runUpstreamErrorTests)
   .then(runJsonStreamTests)
   .then(runSseTests)
   .then(runStreamParityTests)

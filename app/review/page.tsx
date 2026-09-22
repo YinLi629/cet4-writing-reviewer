@@ -1,3 +1,4 @@
+import { BackToTop } from "@/components/BackToTop";
 import { EssayForm } from "@/components/EssayForm";
 
 /**
@@ -19,7 +20,7 @@ const FEATURES = [
   },
   {
     label: "不存你的作文",
-    hint: "结果只留在当前标签页里，服务端不留作文，关掉就没了",
+    hint: "服务端不留作文，报告只存在你自己这个浏览器里，换台设备就看不到",
   },
 ];
 
@@ -42,6 +43,10 @@ export default function ReviewPage() {
       </div>
 
       <EssayForm />
+
+      {/* 放在页面上而不是表单里：批改中表单会被等待界面整个替换掉，
+          而等待界面才是这一页最长的时候，按钮不能跟着一起消失 */}
+      <BackToTop />
     </div>
   );
 }

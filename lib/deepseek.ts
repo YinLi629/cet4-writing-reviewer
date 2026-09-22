@@ -161,57 +161,90 @@ export async function chatJSON<T>(opts: ChatJSONOptions): Promise<ChatJSONResult
     else external.addEventListener("abort", onExternalAbort, { once: true });
   }
 
-  let res: Response;
+  // 定时器和监听器的清理必须包住**整段**：从 fetch 一直到读完 body。
+  //
+  // 原来 clearTimeout 写在 fetch 的 finally 里，于是 fetch 一 resolve（响应头到了）
+  // 定时器就没了，而真正耗时、也真正会挂住的是后面的读 body（res.text() / res.json()）。
+  // 上游发完响应头就不吐 body 时，REVIEW_TIMEOUT_MS 形同虚设：请求一路挂到平台
+  // maxDuration 被掐断，用户只拿到一条平台级报错，而额度已经烧掉了。
+  // 流式路径（openChatStream）早就把"总预算"扩到了整个生成过程，这里补上另一半。
   try {
-    res = await fetch(`${getBaseUrl()}/chat/completions`, {
-      method: "POST",
-      headers: chatHeaders(apiKey),
-      body: JSON.stringify(buildChatBody(opts, model, false)),
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${getBaseUrl()}/chat/completions`, {
+        method: "POST",
+        headers: chatHeaders(apiKey),
+        body: JSON.stringify(buildChatBody(opts, model, false)),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      // 判据用 controller.signal.aborted，而不是 err.name === "AbortError"：
+      // undici 在不同版本上分别抛 AbortError 和 TypeError("terminated")，
+      // 而"这个 controller 被掐过"是唯一无歧义的事实。判错的话超时会被归到
+      // UNKNOWN，用户看到的就不是超时提示了。
+      if (controller.signal.aborted) {
+        // 分清是谁掐的。客户端先断开时不能报超时——既误导用户，也会把
+        // "用户自己关页面"记成服务端故障
+        throw abortErrorFor(external?.aborted ? "client" : "budget");
+      }
+      // 网络层细节只进服务端日志，不透给客户端
+      console.error("[deepseek] 请求模型服务失败：", err);
+      throw new LLMError(
+        "UPSTREAM_ERROR",
+        "无法连接到模型服务。请检查服务端网络与 DEEPSEEK_BASE_URL 配置，详情见服务端日志。",
+      );
+    }
+
+    if (!res.ok) {
+      const failure = await upstreamFailure(res);
+      throw failure.error;
+    }
+
+    // ⚠️ 这里的 catch 不能一律吞成 null。超时/断开时 res.json() 抛的正是
+    // AbortError，吞掉之后 raw 会是空串，于是报成 BAD_MODEL_OUTPUT
+    // 「模型返回了空内容」——一句和事实完全相反的话：模型一个字都没读到，
+    // 是因为我们把它掐了。原样抛出，交给外层 catch 翻译成 TIMEOUT。
+    // 只有"真的解析不了"（响应体不是 JSON）才回落 null。
+    const payload = (await res.json().catch((err: unknown) => {
+      if (controller.signal.aborted) throw err;
+      return null;
+    })) as
+      | {
+          choices?: Array<{ message?: { content?: string } }>;
+          usage?: ChatJSONResult<T>["usage"];
+        }
+      | null;
+
+    const raw = payload?.choices?.[0]?.message?.content ?? "";
+    if (!raw.trim()) {
+      throw new LLMError("BAD_MODEL_OUTPUT", "模型返回了空内容。");
+    }
+
+    const data = extractJson<T>(raw);
+    return {
+      data,
+      raw,
+      model,
+      elapsedMs: Date.now() - startedAt,
+      usage: payload?.usage,
+    };
   } catch (err) {
-    clearTimeout(timeout);
-    if (err instanceof Error && err.name === "AbortError") {
-      // 分清是谁掐的。客户端先断开时不能报超时——既误导用户，也会把
-      // "用户自己关页面"记成服务端故障
+    // 读 body 期间被掐的翻译。fetch 那时已经 resolve，抛出来的不是 fetch 的
+    // AbortError 而是 res.text()/res.json() 的失败，上面那层 catch 接不到。
+    // 在这里补上，保证"读 body 超时"和"连接超时"给出同一个码和同一句文案。
+    //
+    // LLMError 必须原样放行：`!res.ok` 分支里 upstreamFailure 的 res.text() 会被
+    // 它自己的 .catch 吞掉，于是抛出来的是带着真实 status 的 UPSTREAM_ERROR——
+    // 那时 signal 往往也已经是 aborted。不排除 LLMError 的话，一条清晰的
+    // "上游返回 500"会被改写成 TIMEOUT，把最有用的信息丢掉。
+    if (!(err instanceof LLMError) && controller.signal.aborted) {
       throw abortErrorFor(external?.aborted ? "client" : "budget");
     }
-    // 网络层细节只进服务端日志，不透给客户端
-    console.error("[deepseek] 请求模型服务失败：", err);
-    throw new LLMError(
-      "UPSTREAM_ERROR",
-      "无法连接到模型服务。请检查服务端网络与 DEEPSEEK_BASE_URL 配置，详情见服务端日志。",
-    );
+    throw err;
   } finally {
     clearTimeout(timeout);
     external?.removeEventListener("abort", onExternalAbort);
   }
-
-  if (!res.ok) {
-    const failure = await upstreamFailure(res);
-    throw failure.error;
-  }
-
-  const payload = (await res.json().catch(() => null)) as
-    | {
-        choices?: Array<{ message?: { content?: string } }>;
-        usage?: ChatJSONResult<T>["usage"];
-      }
-    | null;
-
-  const raw = payload?.choices?.[0]?.message?.content ?? "";
-  if (!raw.trim()) {
-    throw new LLMError("BAD_MODEL_OUTPUT", "模型返回了空内容。");
-  }
-
-  const data = extractJson<T>(raw);
-  return {
-    data,
-    raw,
-    model,
-    elapsedMs: Date.now() - startedAt,
-    usage: payload?.usage,
-  };
 }
 
 /**
@@ -376,11 +409,27 @@ export interface ChatStreamHandle {
 interface StreamWatch {
   controller: AbortController;
   reason: AbortReason;
-  /** 收到新数据就续命（重置停滞计时器） */
+  /**
+   * 收到新数据就续命（重置停滞计时器），并且负责**首次启动**它。
+   * 首次启动的时机见 createAbortWatch 的注释——那正是这里唯一的坑。
+   */
   kick(): void;
   dispose(): void;
 }
 
+/**
+ * 三个中止来源合成一个 controller。
+ *
+ * **停滞计时器不在这里启动。** 它只该管"生成期卡住"，不该管"连接期"：
+ * 上游 TTFB 超过 REVIEW_STALL_MS（长 prompt 下很常见）时，连接好好的、还在
+ * 等响应头，却被报成"模型超过 30 秒没有返回新内容"——一句和事实不符的提示，
+ * 而且它会掩盖真正的原因。连接期的上限由 budget 计时器兜着（REVIEW_TIMEOUT_MS），
+ * 那条文案才对得上"等不到响应"。
+ *
+ * 所以改由调用方在**拿到响应头之后**调一次 kick() 启动它（openChatStream 里）。
+ * 改了这里要连带想清楚两件事：要么 TTFB 又被算进停滞，要么停滞计时器根本
+ * 不启动——读循环挂住时没人掐它。
+ */
 function createAbortWatch(external: AbortSignal | undefined): StreamWatch {
   const controller = new AbortController();
   const watch: StreamWatch = {
@@ -407,7 +456,7 @@ function createAbortWatch(external: AbortSignal | undefined): StreamWatch {
       controller.abort();
     }, getStallMs());
   };
-  arm();
+  // 这里刻意不调用 arm()：见上面 createAbortWatch 的注释。
 
   const onExternalAbort = () => {
     watch.reason = "client";
@@ -501,6 +550,14 @@ export async function openChatStream(
     watch.dispose();
     throw new LLMError("UPSTREAM_ERROR", "模型服务没有返回响应体，批改未能完成。");
   }
+
+  // 响应头到了 —— 生成期从这一刻开始计时，停滞计时器在这里才启动。
+  //
+  // 放在这个位置而不是 createAbortWatch 里，是因为前面那段路也不算生成期：
+  // 上游回非 2xx、去掉 response_format 再重试一次，那两次 fetch 都是在等响应头。
+  // 从 openChatStream 返回到 handle.read() 之间只有一次 emit(meta) 和一个
+  // setInterval，所以在这里启动不会误掐正常的流。
+  watch.kick();
 
   return makeStreamHandle(res, model, startedAt, watch, opts.onDelta);
 }

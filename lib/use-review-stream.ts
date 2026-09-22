@@ -25,6 +25,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createSseFrameParser, type SseFrame } from "./sse";
 import { pushHistory, saveAccessCode, saveResult } from "./store";
 import {
+  deadlineCode,
+  deadlineFor,
+  deadlineMessage,
+  readPhase,
+  type ReadPhase,
+} from "./watchdog";
+import {
   DIMENSIONS,
   type DimensionScore,
   type ReviewProgress,
@@ -132,6 +139,23 @@ export function useReviewStream(): UseReviewStream {
         router.push("/result");
       };
 
+      /**
+       * 读循环的看门狗定时器。
+       *
+       * 声明在 try 外面，是为了 finally 也能清掉它——循环里任何一处抛异常
+       * （用户取消、网络报错）都会跳过循环后面那行 clearWatchdog，
+       * 留下一个还在跑的定时器。它响的时候顶多多 abort 一次已经作废的 controller，
+       * 不会出错，但白占一个句柄最长 110 秒，属于不该留的垃圾。
+       */
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
+
+      const clearWatchdog = (): void => {
+        if (watchdog !== null) {
+          clearTimeout(watchdog);
+          watchdog = null;
+        }
+      };
+
       void (async () => {
         try {
           const res = await fetch("/api/review", {
@@ -186,14 +210,71 @@ export function useReviewStream(): UseReviewStream {
           // 在闭包里赋值的变量，外层读到的类型是声明类型，收窄不了
           let outcome: FrameOutcome = { kind: "continue" };
 
+          // 收到过字节没有。见 lib/watchdog.ts 里两个阈值为什么差这么多
+          let headSeen = false;
+
+          /**
+           * 带看门狗的 `read()`。返回 null 表示是看门狗先判的死，不是流正常结束。
+           *
+           * 为什么非有不可：TCP 静默黑洞（对端不告而别，既没 FIN 也没 RST）下
+           * `reader.read()` 既不 resolve 也不 reject。而服务端并不知道我们的连接已经死了，
+           * 它照样每 2 秒往一个没人收的 socket 里写心跳，一路写到自己的预算耗尽。
+           * 这段窗口里用户看到的就是「已用 N 秒」一直往上数、转圈、没有任何异常——
+           * 在加这个之前，唯一的出路是用户自己想到去按取消。
+           */
+          const readWithWatchdog = (): Promise<
+            ReadableStreamReadResult<Uint8Array> | null
+          > =>
+            new Promise((resolve, reject) => {
+              const phase = readPhase(headSeen);
+              watchdog = setTimeout(() => {
+                watchdog = null;
+                // 先掐连接再返回：给服务端的 request.signal 一个机会，
+                // 别让它继续为一个没人要的结果付上游的钱
+                controller.abort();
+                resolve(null);
+              }, deadlineFor(phase));
+
+              // 注意这里两个分支都要 clearTimeout，包括成功分支——
+              // 否则每次读到数据都留下一个还在跑的定时器，几万个心跳下来就是几万个句柄
+              reader.read().then(
+                (result) => {
+                  clearWatchdog();
+                  resolve(result);
+                },
+                (err: unknown) => {
+                  clearWatchdog();
+                  reject(err);
+                },
+              );
+            });
+
           for (;;) {
-            const { done, value } = await reader.read();
+            const chunk = await readWithWatchdog();
+            if (!chunk) {
+              // 看门狗判死。它已经 abort 过了，这里只负责把话说清楚。
+              // headSeen 在 await 期间不可能变（只有循环体改它），所以这里重算一遍
+              // 拿到的一定是定时器当初取的那一段
+              const phase = readPhase(headSeen);
+              fail(deadlineMessage(phase), deadlineCode(phase));
+              return;
+            }
+
+            const { done, value } = chunk;
             if (done) break;
+
+            // 第一个字节到了就够了：服务端在 meta 之后立刻起心跳定时器
+            // （lib/review.ts），所以"收到过字节"等价于"心跳机制已经在跑"。
+            // 这一段的沉默从此有了意义——它只能是链路出问题
+            headSeen = true;
 
             const frames = parser.push(decoder.decode(value, { stream: true }));
             outcome = handleFrames(frames, { fail, setProgress });
             if (outcome.kind !== "continue") break;
           }
+
+          // 走到这里看门狗已经没用了（下面要么跳转要么报错），
+          // 由 finally 统一清掉，不在这里重复一遍
 
           if (outcome.kind === "result") {
             succeed(outcome.result);
@@ -220,6 +301,7 @@ export function useReviewStream(): UseReviewStream {
             `请求没有发出去：${err instanceof Error ? err.message : String(err)}`,
           );
         } finally {
+          clearWatchdog();
           abortRef.current = null;
         }
       })();

@@ -28,6 +28,14 @@
 import { NextResponse } from "next/server";
 
 import { hasAccessCode, verifyAccessCode } from "@/lib/access";
+import {
+  ACCESS_DENIED_MESSAGE,
+  humanizeWait,
+  lockedAfterFailureMessage,
+  lockedMessage,
+  MISSING_CONFIG_MESSAGE,
+  penalizeAccessFailure,
+} from "@/lib/access-gate";
 import { getModel, hasApiKey, LLMError } from "@/lib/deepseek";
 import { clientKeyFrom, isOverLimit } from "@/lib/rate-limit";
 import { getGate, persistenceMode } from "@/lib/rate-limit-store";
@@ -85,13 +93,8 @@ function errorResponse(
   );
 }
 
-/** 把毫秒换算成「多久后再试」的人话 */
-function humanizeWait(ms: number): string {
-  const seconds = Math.ceil(ms / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.ceil(seconds / 60);
-  return `${minutes} 分钟`;
-}
+// humanizeWait / 口令失败的处置与文案都在 lib/access-gate.ts ——
+// 这一层和 /api/access 共用同一份，见那个文件的头注释
 
 // isOverLimit 在 lib/rate-limit.ts —— 它是策略，放那儿自测才够得着
 
@@ -104,11 +107,9 @@ export async function POST(request: Request) {
   const state = await gate.peek(clientKey);
 
   if (state.lockRetryAfterMs > 0) {
-    return errorResponse(
-      "RATE_LIMITED",
-      `访问口令连续输错太多次，已暂时锁定，请 ${humanizeWait(state.lockRetryAfterMs)}后再试。`,
-      { "Retry-After": String(Math.ceil(state.lockRetryAfterMs / 1000)) },
-    );
+    return errorResponse("RATE_LIMITED", lockedMessage(state.lockRetryAfterMs), {
+      "Retry-After": String(Math.ceil(state.lockRetryAfterMs / 1000)),
+    });
   }
   // +1：peek 读到的计数不含当前这个请求（见 isOverLimit）
   if (isOverLimit(gate.policy.reviewLimit, state.windowCount + 1)) {
@@ -142,28 +143,19 @@ export async function POST(request: Request) {
 
     // 只有"口令错了"才记失败。缺配置是站长的锅，不该把调用方锁掉
     if (code === "INVALID_ACCESS_CODE") {
-      const failure = await gate.recordFailure(clientKey);
-      // 人为拖慢，抬高串行爆破的成本。代价是正常用户打错一次也要等这一下。
-      // 放在 recordFailure 之后：这一下延迟正好盖住数据库那次往返
-      if (gate.policy.failDelayMs > 0) {
-        await new Promise((r) => setTimeout(r, gate.policy.failDelayMs));
-      }
+      const { lockedForMs } = await penalizeAccessFailure(gate, clientKey);
       // 这次失败刚好锁上的话，文案里直接说清楚还要等多久——否则用户只会看到
       // "口令不正确"，再试一次才被告知被锁了
-      if (failure.lockRetryAfterMs > 0) {
-        return errorResponse(
-          "RATE_LIMITED",
-          `访问口令不正确，且连续输错次数过多，已锁定，请 ${humanizeWait(failure.lockRetryAfterMs)}后再试。`,
-          { "Retry-After": String(Math.ceil(failure.lockRetryAfterMs / 1000)) },
-        );
+      if (lockedForMs > 0) {
+        return errorResponse("RATE_LIMITED", lockedAfterFailureMessage(lockedForMs), {
+          "Retry-After": String(Math.ceil(lockedForMs / 1000)),
+        });
       }
     }
 
     return errorResponse(
       code,
-      code === "MISSING_ACCESS_CODE"
-        ? "服务端没有配置访问口令，批改功能暂不可用。请在环境变量里设置 REVIEW_ACCESS_CODE 后重启或重新部署。"
-        : "访问口令不正确。请检查后重试。",
+      code === "MISSING_ACCESS_CODE" ? MISSING_CONFIG_MESSAGE : ACCESS_DENIED_MESSAGE,
     );
   }
 

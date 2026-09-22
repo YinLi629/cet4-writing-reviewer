@@ -8,7 +8,8 @@ import { MEME_IDS, MemeCats } from "@/components/MemeCats";
  * 纯静态 markup、零 JS：表情包墙是 CSS grid 铺出来的，顺序写死在下面，
  * 所以这一页不需要水合，首屏也没有"先白一下"的窗口。
  *
- * 真正的批改页在 /review。这页只有一个出口，就是那个按钮。
+ * 这页只有一个出口，就是那个按钮，落在 /access（口令页）而不是 /review：
+ * 先进门再干活，两件事分开。口令验过了才会到批改页。
  */
 
 /**
@@ -72,7 +73,8 @@ export default function LandingPage() {
         {/* 花体英文是标题，中文原话留在下面：字是给眼睛看的，话是给人懂的 */}
         <p className="landing-caption">康神开播了，真的假的？</p>
 
-        <Link href="/review" className="btn btn-primary btn-lg landing-cta">
+        {/* 出口指向口令页，不是批改页：先进门再干活，两件事分在两页（见 app/access/page.tsx） */}
+        <Link href="/access" className="btn btn-primary btn-lg landing-cta">
           真开播了！
         </Link>
 

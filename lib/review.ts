@@ -21,19 +21,21 @@ import {
   parseStreamedJSON,
   type ChatStreamRead,
 } from "./deepseek";
-import { attachLocations } from "./evidence";
+import { attachLocations, locateQuote } from "./evidence";
 import { scanJsonPrefix, type ScanResult } from "./json-stream";
 import { buildReviewPrompt, MAX_EVIDENCE, minEvidenceFor } from "./prompt";
 import { computeStats, type TextStats } from "./text-stats";
+import { coerceTrainingFocus, TRAINING_FOCUS_DIMENSION } from "./training";
 import {
   applyCeiling,
   bandForScore,
-  clampScore15,
   DIMENSION_MAX,
   enforcedCeilings,
   ESSAY_MAX_SCORE_106,
   isValidBandLevel,
+  readScore15,
   RUBRIC_VERSION,
+  score15Field,
   strictestCeiling,
   toScore106,
 } from "./rubric";
@@ -51,6 +53,8 @@ import {
   type ReviewRequest,
   type ReviewResult,
   type ReviewStreamEvent,
+  type TrainingFocus,
+  type TrainingItem,
   type UpgradeAction,
 } from "./types";
 
@@ -122,10 +126,27 @@ function asDimension(v: unknown): Dimension | null {
   return (DIMENSIONS as string[]).includes(s) ? (s as Dimension) : null;
 }
 
-function asKind(v: unknown): EvidenceKind {
+/**
+ * 收拢模型给的 `kind`。
+ *
+ * 非法值（含缺失、大小写混乱之外的各种意外）一律按 `minor` 兜底，**但会带上
+ * degraded 标记**。原来也是兜底成 minor，问题不在兜底值，在于兜底是**无声的**：
+ * `minor` 同时喂给展示（颜色）和判分——lib/review.ts 的分数上限规则按 major 条数
+ * 算——于是一次字段异常会悄悄把"3 条以上严重错误 → 上限 9 分""5 条以上 → 上限 6 分"
+ * 整条掐掉，模型的 11 分照旧发出去，报告上看不出任何异常。
+ *
+ * 为什么兜底成 minor 而不是丢弃：丢弃会让证据条数缩水，进而触发
+ * `BAD_MODEL_OUTPUT`（一条证据都没有时）或少一条证据的警告——把一个字段写错
+ * 升级成"这次批改失败"，代价不成比例。保留条目 + 降级 + 把这件事说出来，
+ * 才是这一处该有的取舍。
+ *
+ * 归一化逻辑（trim + toLowerCase）保持原样，这是它的超集：`"MAJOR"`、`" major "`
+ * 仍然正常识别为 major，不算降级。
+ */
+export function coerceKind(v: unknown): { kind: EvidenceKind; degraded: boolean } {
   const s = typeof v === "string" ? v.trim().toLowerCase() : "";
-  if (s === "strength" || s === "major" || s === "minor") return s;
-  return "minor";
+  if (s === "strength" || s === "major" || s === "minor") return { kind: s, degraded: false };
+  return { kind: "minor", degraded: true };
 }
 
 function asInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -138,6 +159,8 @@ export interface RawEvidenceItem {
   id: string;
   dimension: Dimension;
   kind: EvidenceKind;
+  /** kind 是兜底来的（模型给的既不是 strength 也不是 major/minor）。见 coerceKind */
+  kindDegraded?: boolean;
   quote: string;
   comment: string;
   suggestion?: string;
@@ -170,11 +193,14 @@ export function parseEvidenceItem(
 
   const comment = asString(o.comment, "（模型未给出说明）");
   const suggestion = asString(o.suggestion);
+  const { kind, degraded } = coerceKind(o.kind);
 
   return {
     id: `e${seq}`,
     dimension,
-    kind: asKind(o.kind),
+    kind,
+    // 只降级时才写上这个字段，保留路径上不多一个 undefined 键
+    ...(degraded ? { kindDegraded: true } : {}),
     quote,
     comment,
     suggestion: suggestion || undefined,
@@ -235,11 +261,71 @@ function parseDimensionScores(
   return DIMENSIONS.map((d) => byDim.get(d)!);
 }
 
+/** 训练项条数上限。报告结尾塞 8 条等于没有重点。 */
+const MAX_TRAINING_ITEMS = 3;
+
+/**
+ * 规格化模型给的改写示范。
+ *
+ * 判为无效的四种情况，每种都对应一种模型敷衍的具体方式：
+ * - 没给 / 缺字段 / 非字符串 → 干脆没写；
+ * - 两端去空白后为空        → 写了个空壳；
+ * - **before 与 after 相同** → 写了等于没写。这条最容易漏：字段都在、格式也合法，
+ *   报告上看起来是一条正常的示范，但"改写"前后一模一样，学生照着看学不到任何东西；
+ * - before 超过 MAX_QUOTE_CHARS(500) → 模型把整段贴了进来。这同时是**性能护栏**，
+ *   下面 locateExampleQuote 的模糊匹配是平方量级的。护栏放在这里而不是那边，
+ *   是因为这里是纯函数、能被 selftest 直接断言。
+ *
+ * 返回 undefined 与"没有 example 字段"是**同一件事**——调用方不必区分，
+ * 渲染侧统一显示"本条没有改写示范"。
+ */
+export function coerceExample(
+  raw: unknown,
+): { before: string; after: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+
+  const before = asString(o.before);
+  const after = asString(o.after);
+  if (!before || !after) return undefined;
+
+  // 改写示范前后一样 = 模型没真的改，等于没写
+  if (before === after) return undefined;
+
+  if (before.length > MAX_QUOTE_CHARS) return undefined;
+
+  return { before, after };
+}
+
+/**
+ * 核查 example.before 是不是真的在原文里——把 example 从"模型说啥是啥"
+ * 变成**可证伪**。和证据坐标同一个哲学：坐标不由模型给，由服务端拿引文回原文里
+ * 重新找，找不到就如实标出来。
+ *
+ * ⚠️ **只认 exact / normalized，不能退到 fuzzy。**
+ * locateQuote 在找不到逐字命中时会一路退到 fuzzyLocate，那里的阈值是
+ * **词重叠 ≥80%**（lib/evidence.ts 的 FUZZY_THRESHOLD）。证据引文通常是一整个
+ * 从句，80% 重叠仍有判别力；但升档示范是**短句**，3 个词里中 3 个就算命中——
+ * 模型编一句 "I very like"、原文是 "I like very much"，fuzzy 会判成命中，
+ * 于是**编造的示范被标成"已验证"**，正好是本功能要抓的那种失效。
+ * 所以这里的口径必须比证据那条严。改这一行之前先想清楚代价。
+ *
+ * 不传 claimed：这里只做"这句话在不在原文里"的事实核查，**不参与高亮区间的分配**，
+ * 和证据定位互不影响。同一句在原文里出现多次仍算"在"，所以 ambiguity / hitCount
+ * 一律不看。
+ */
+export function locateExampleQuote(essay: string, before: string): boolean {
+  if (!essay || !before) return false;
+  const hit = locateQuote(essay, before);
+  return hit.method === "exact" || hit.method === "normalized";
+}
+
 function parseUpgradePlan(
   v: unknown,
   evidence: Evidence[],
   bandLevel: number,
   targetLevel: number | undefined,
+  essay: string,
 ): UpgradeAction[] {
   const raw = Array.isArray(v) ? v : [];
   const validIds = new Set(evidence.map((e) => e.id));
@@ -254,15 +340,10 @@ function parseUpgradePlan(
 
     const dimension = asDimension(o.dimension) ?? "language";
 
-    // example 要么 before/after 都有，要么整个丢掉
-    let example: UpgradeAction["example"];
-    const ex = o.example;
-    if (ex && typeof ex === "object") {
-      const eo = ex as Record<string, unknown>;
-      const before = asString(eo.before);
-      const after = asString(eo.after);
-      if (before && after) example = { before, after };
-    }
+    // 规格化和核查是两件事，分开做：**没给**和**编了**是两种不同的失效，
+    // 报告上要能分别显示（见 lib/types.ts 上的 exampleMissing / exampleUnverified）
+    const example = coerceExample(o.example);
+    const exampleUnverified = example ? !locateExampleQuote(essay, example.before) : false;
 
     // 模型自己给的关联证据：只保留真实存在的 id
     const provided = Array.isArray(o.linkedEvidenceIds)
@@ -281,6 +362,10 @@ function parseUpgradePlan(
       action,
       rationale: asString(o.rationale, `这一项是从 ${bandLevel} 档${goal}的必要条件。`),
       example,
+      // 两个标记都必须**可选**：scripts/selftest.ts 里有内联的 UpgradeAction 字面量，
+      // 加必填字段会让那份文件整体编不过（不是几条断言变红，是全部失效）
+      ...(example ? {} : { exampleMissing: true }),
+      ...(exampleUnverified ? { exampleUnverified: true } : {}),
       linkedEvidenceIds: provided,
     });
 
@@ -313,6 +398,68 @@ function parseUpgradePlan(
   });
 
   return deduped;
+}
+
+/**
+ * 训练项解析。
+ *
+ * 模型只给「练什么（focus）+ 为什么（reason）」，练法文案由服务端查表
+ * （lib/training.ts 的 TRAINING_PLAYBOOK）。这么切是因为练法要可写断言、措辞统一、
+ * 零幻觉，交给模型生成三样都没有；而"这篇最该练什么"非读过这篇作文不能知。
+ *
+ * 和 parseUpgradePlan 最大的区别：这里**非法即丢**，不学 coerceKind 那样降级兜底。
+ * kind 有"最轻的一档"可以兜，兜错只是颜色和严重度偏轻；focus 兜到任何一类都是
+ * 给出一整套**错误的练法**，比少一条糟得多。所以认不出来就整条丢。
+ * 但纯粹的"写法"差异（大小写、两端空白）会先归一化，不算非法
+ * ——见 lib/training.ts 的 coerceTrainingFocus。
+ */
+function parseTrainingPlan(v: unknown, evidence: Evidence[]): TrainingItem[] {
+  const raw = Array.isArray(v) ? v : [];
+  const validIds = new Set(evidence.map((e) => e.id));
+  const out: TrainingItem[] = [];
+  const seen = new Set<TrainingFocus>();
+
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+
+    const focus = coerceTrainingFocus(o.focus);
+    if (!focus) continue;
+
+    // 同一个类别练一次就够，重复说明模型在凑数
+    if (seen.has(focus)) continue;
+    seen.add(focus);
+
+    // 没有理由的训练项说服不了学生去练，在报告上也只是个孤零零的标签
+    const reason = asString(o.reason);
+    if (!reason) continue;
+
+    const provided = Array.isArray(o.linkedEvidenceIds)
+      ? (o.linkedEvidenceIds.filter(
+          (x) => typeof x === "string" && validIds.has(x),
+        ) as string[])
+      : [];
+
+    out.push({ focus, reason, linkedEvidenceIds: provided });
+
+    // 上限 3：报告结尾塞 8 条等于没有重点，1-3 条才叫"最该练的"
+    if (out.length >= MAX_TRAINING_ITEMS) break;
+  }
+
+  // 模型没给关联证据的，按 focus 对应的维度自动挂上同维度证据——照抄
+  // parseUpgradePlan 的同一套做法，报告里才能从训练项跳回证据卡。
+  // filter 会新建数组，所以下面的 sort 原地排序不会动到 evidence 本身
+  for (const item of out) {
+    if (item.linkedEvidenceIds.length > 0) continue;
+    const dim = TRAINING_FOCUS_DIMENSION[item.focus];
+    item.linkedEvidenceIds = evidence
+      .filter((e) => e.dimension === dim)
+      .sort((a, b) => kindWeight(b.kind) - kindWeight(a.kind))
+      .slice(0, 3)
+      .map((e) => e.id);
+  }
+
+  return out;
 }
 
 function kindWeight(kind: EvidenceKind): number {
@@ -370,6 +517,29 @@ export function assembleResult(
       `有 ${unverified.length} 条引用没能在原文中定位（模型可能改写了原文），这些条目在报告里已标出，请以原文为准。`,
     );
   }
+
+  // 定位成功、但有歧义的条目：**这是最需要主动说出来的一类**。
+  // 未定位是响亮失败（报告里有红字），而"定位了但可能不是那一处"没有任何线索
+  // ——徽章上照样写着"逐字命中原文"。不主动说，用户就完全看不出来。
+  const ambiguous = evidence.filter((e) => e.ambiguity);
+  if (ambiguous.length > 0) {
+    const multiple = ambiguous.filter((e) => e.ambiguity === "multiple").length;
+    warnings.push(
+      `有 ${ambiguous.length} 条引用在原文里能找到不止一处相近的匹配（其中 ${multiple} 条是同一段文字出现多次），` +
+        `高亮落在哪一处是按上下文推断的。引用太短或太常见时会出现这种情况，请对照原文确认。`,
+    );
+  }
+
+  // kind 兜底：模型给的严重程度不是三个合法值之一，按最轻的 minor 处理了。
+  // 必须说出来，因为分数上限规则按 major 条数算——静默降级会连带把上限规则
+  // 一起废掉，报告看起来完全正常，实际分数没有经过校正。
+  const degradedKinds = evidence.filter((e) => e.kindDegraded).length;
+  if (degradedKinds > 0) {
+    warnings.push(
+      `有 ${degradedKinds} 条证据的严重程度字段模型没有给对（既不是亮点也不是小错/严重错误），已按“小错”处理。` +
+        `这会让“严重错误条数”偏少，本报告的分数上限校正可能没有完全生效。`,
+    );
+  }
   const evidenceMin = minEvidenceFor(stats);
   if (evidence.length < evidenceMin) {
     warnings.push(
@@ -396,7 +566,22 @@ export function assembleResult(
 
   // 2) 维度诊断（不参与总分）。先按模型给的原分算出临时档次，只用于给缺失的
   //    维度补一个兜底分值，避免"档次依赖维度分、维度分又依赖档次"的循环。
-  const rawScore = clampScore15(raw.score15);
+  const rawScore = readScore15(raw.score15);
+  // score15 是**全文唯一的计分来源**，而 readScore15 会把读不出来的值收成 0 分。
+  // 0 分是个合法分数，下游看不出区别，所以这里必须自己把异常说出来：
+  // 否则模型把分数写成写不动的值时，用户拿到的是一份"看起来完全正常、但 0 分 0 档"
+  // 的报告——这正是这一轮要修的那个静默出错。
+  if (score15Field(raw.score15) === "unusable") {
+    // 把收到的值截断后附上：不带的话，服务端日志里只剩一句"字段不可用"，
+    // 排不出是模型漏了字段还是给了个字符串。截断是为了防一个超长字符串
+    // 把这条警告撑成一整屏
+    const shown =
+      typeof raw.score15 === "string" ? raw.score15.slice(0, 40) : String(raw.score15);
+    warnings.push(
+      `模型没有给出可用的总分（score15 字段缺失或不是数字，收到的是「${shown}」）。` +
+        `本报告的分数按 0 分处理，仅供参考，建议重试一次以获取有效分数。`,
+    );
+  }
   const dimensionScores = parseDimensionScores(
     raw.dimensionScores,
     bandForScore(rawScore).level,
@@ -427,15 +612,30 @@ export function assembleResult(
   const band = bandForScore(score15);
   const score106 = toScore106(score15);
 
-  // 4) 升档建议
+  // 4) 升档建议。essay 要传进去，否则没法核查 example.before 在不在原文里
   const upgradePlan = parseUpgradePlan(
     raw.upgradePlan,
     evidence,
     band.level,
     input.targetBandLevel,
+    input.essay,
   );
   if (upgradePlan.length === 0) {
     warnings.push("模型没有返回升档建议，报告中的建议部分为空。");
+  }
+
+  // 模型给的 before 在原文里找不到，说明它自己造了句子。和证据坐标同一套哲学：
+  // 抄错要能被抓到，而不是画一个看起来精确、实际对不上原文的示范。
+  //
+  // ⚠️ 这条 warning **必须在这里拼**，不能在 parseUpgradePlan 里：那个函数收不到
+  // warnings，而且它是本函数的 warnings 已经构建完之后才被调用的。
+  // 另外 exampleMissing **不产生** warning——没给示范是正常降级（纯 organization
+  // 的建议本就落不到单句上），不是故障。见 lib/types.ts。
+  const fabricated = upgradePlan.filter((a) => a.exampleUnverified).length;
+  if (fabricated > 0) {
+    warnings.push(
+      `有 ${fabricated} 条升档建议的改写示范没能在原文中找到（模型可能自己造了句子），这些示范仅供参考，请以原文为准。`,
+    );
   }
 
   // 5) 总评与优点
@@ -444,6 +644,11 @@ export function assembleResult(
     `本文评为${band.label}（${band.range[0]}-${band.range[1]} 分区间），折算 ${score106} 分（满分 ${ESSAY_MAX_SCORE_106}）。`,
   );
   const strengths = asStringArray(raw.strengths, 5);
+
+  // 6) 训练区。模型只给「练什么 + 为什么」，练法由服务端查表（lib/training.ts）。
+  //    整节为空是**正常**的——说明这篇没有明显反复出现的毛病，不是故障，
+  //    所以既不报 warning，报告里也不显示一个空壳。
+  const trainingPlan = parseTrainingPlan(raw.trainingPlan, evidence);
 
   return {
     essay: input.essay,
@@ -455,10 +660,15 @@ export function assembleResult(
     strengths,
     evidence,
     upgradePlan,
+    // 只在非空时挂上去：空数组和 undefined 对渲染侧是同一件事（都整节不显示），
+    // 但省掉一个字段能让新旧报告的形状一致
+    ...(trainingPlan.length > 0 ? { trainingPlan } : {}),
     stats: {
       ...stats,
       evidenceCount: evidence.length,
       verifiedCount: evidence.length - unverified.length,
+      // 子计数，不参与"已定位/未定位"的二分：verifiedCount 的算法一个字没动
+      ambiguousCount: ambiguous.length,
     },
     warnings,
     meta: {
@@ -515,6 +725,10 @@ function toPendingEvidence(e: RawEvidenceItem): PendingEvidence {
     id: e.id,
     dimension: e.dimension,
     kind: e.kind,
+    // kind 是否兜底来的，在解析时就已经定了、也不依赖整批引文，所以这里照传。
+    // 漏传的话，渐进视图里那个"严重程度未标注"的虚线提示会等到最终结果才出现，
+    // 而流式视图正是用户盯得最久的那一屏
+    ...(e.kindDegraded ? { kindDegraded: true } : {}),
     quote: e.quote,
     comment: e.comment,
     suggestion: e.suggestion,
@@ -719,7 +933,11 @@ export const __internals = {
   parseEvidenceItem,
   parseDimensionScores,
   parseUpgradePlan,
+  parseTrainingPlan,
   assembleResult,
   computeStats,
   asInt,
+  coerceKind,
+  coerceExample,
+  locateExampleQuote,
 };

@@ -14,8 +14,18 @@
 
 import type { Band, Dimension, EvidenceKind } from "./types";
 
-/** 批改标准版本号。改了 BANDS 或 TIER_GAP 就该往上加。 */
-export const RUBRIC_VERSION = "cet4-holistic-2024.1";
+/**
+ * 批改标准版本号。
+ *
+ * 改了 BANDS 或 TIER_GAP 当然要往上加。2024.1 → 2024.2 这次**没有动判分**，
+ * 动的是**输出契约**：升档建议的 example 从可选改为强制、新增训练区
+ * （trainingPlan），JSON_CONTRACT 因此实质重写。
+ *
+ * 为什么这也要升版：meta.rubricVersion 是报告上唯一的契约版本戳，也是评测跑分时
+ * 分辨"这批结果是哪版契约产出的"的唯一依据。不升版的话，新旧报告长得一样，
+ * 事后没法把"改动前后的分数分布"分开看——而那正是改提示词时最需要看的东西。
+ */
+export const RUBRIC_VERSION = "cet4-holistic-2024.2";
 
 /** 作文在 710 分制中的满分 */
 export const ESSAY_MAX_SCORE_106 = 106.5;
@@ -97,10 +107,68 @@ export function toScore106(score15: number): number {
   return Math.round(raw * 10) / 10;
 }
 
-/** 把任何输入收拢成 0-15 的整数 */
+/** 把任何输入收拢成 0-15 的整数。数值层面的夹紧，输入端的收拢见 readScore15 */
 export function clampScore15(n: unknown): number {
   const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
   return Math.max(0, Math.min(ESSAY_MAX_SCORE_15, Math.round(v)));
+}
+
+/**
+ * "整串就是一个数"的判据。
+ *
+ * 不用 Number() 的宽松解析：Number("") === 0、Number(" ") === 0、
+ * Number("0x10") === 16、Number(true) === 1、Number(null) === 0 —— 每一条都会把
+ * "模型没给分数"变成一个**具体的、看起来完全合理的分数**。
+ * 也不用 parseInt：parseInt("12abc") === 12，把一段废话读成 12 分。
+ */
+const NUMERIC_STRING = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+
+/**
+ * `score15` 字段的可用性。给 warnings 用：模型给了个没法当分数的值时，
+ * 报告必须把这件事说出来，而不是安静地按 0 分发出去。
+ */
+export type Score15Field = "number" | "numeric-string" | "unusable";
+
+export function score15Field(n: unknown): Score15Field {
+  if (typeof n === "number") {
+    // NaN / Infinity 也是 typeof "number"，但 readScore15 会读成 0。
+    // 这里说"是 number"就等于把一次静默的 0 分放过去——判据必须和 readScore15 一致
+    return Number.isFinite(n) ? "number" : "unusable";
+  }
+  if (typeof n === "string") {
+    const s = n.trim();
+    // 要求和 readScore15 逐字相同的判据，**并且**解析出来必须是有限值：
+    // 两个函数一旦分叉，就会出现"收下了、却读成 0、而且不报警"的第三种状态
+    // ——那正是这一轮要消灭的东西。自测里有一条专门盯这个一致性
+    if (NUMERIC_STRING.test(s) && Number.isFinite(Number(s))) return "numeric-string";
+  }
+  return "unusable";
+}
+
+/**
+ * 读模型给的 `score15`。**全文唯一的计分来源，所以这里是最该防守的一处。**
+ *
+ * 原来的写法是 `typeof n === "number" ? n : 0`：模型只要把分数写成字符串
+ * （`"score15": "12"`），学生就会拿到一份**看起来完全正常、但显示 0 分 0 档**的报告
+ * ——不报错也不告警，因为对下游来说 0 是个合法分数。同文件的 asInt / asDimension /
+ * asKind 各有各的容错，唯独总分入口不做，方向正好反了。
+ *
+ * 收与不收的界线是"这个值有没有明确的数值含义"，全表见 selftest 的 [2c]：
+ *   · number（有限值）→ 收；NaN / Infinity → 不收
+ *   · "12" / " 12 " / "9.6" / "+3" / ".5" → 收（去空白后整串就是一个数）
+ *   · "12abc" / "" / " " / "0x10" / "1e2" / "12分" → 不收，落 0
+ *   · true / false / null / undefined / 对象 / 数组 → 不收，落 0
+ *
+ * 落了 0 之后**不能就这么算了**：调用方要拿 score15Field 判一下，是 unusable
+ * 就往 warnings 里写一条（见 lib/review.ts）。
+ */
+export function readScore15(n: unknown): number {
+  if (typeof n === "number") return clampScore15(n);
+  if (typeof n === "string") {
+    const s = n.trim();
+    return NUMERIC_STRING.test(s) ? clampScore15(Number(s)) : 0;
+  }
+  return 0;
 }
 
 /**

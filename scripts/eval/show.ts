@@ -89,8 +89,24 @@ for (const r of picked) {
     if (p.example) {
       console.log(`     before: ${p.example.before}`);
       console.log(`     after : ${p.example.after}`);
+      // 没定位到的示范要在人眼前就标出来——这正是"强制给 example"之后
+      // 最需要人看一眼的那一类：机器只负责说"它不在原文里"，是不是编的由人判
+      if (p.exampleUnverified) console.log(`     ⚠ 上面那个 before 没能在原文中定位`);
+    } else {
+      console.log(`     （没给示范${p.exampleMissing ? "，已标记" : ""}）`);
     }
     if (p.linkedEvidenceIds.length) console.log(`     关联证据：${p.linkedEvidenceIds.join(", ")}`);
+  }
+
+  // 不打印 13 类练法的正文——那是查表来的通用文案，每次都一样，
+  // 打出来只会把样本之间的差异淹掉。这里要看的只有两件事：
+  // 挑的类别对不对、reason 是不是真在说这一篇。
+  const training = res.trainingPlan ?? [];
+  console.log(`\n【训练区 ${training.length} 项】`);
+  if (training.length === 0) console.log("  （这篇没有反复出现的毛病）");
+  for (const t of training) {
+    console.log(`  [${t.focus}] ${t.reason}`);
+    if (t.linkedEvidenceIds.length) console.log(`     关联证据：${t.linkedEvidenceIds.join(", ")}`);
   }
 
   if (res.warnings.length) {

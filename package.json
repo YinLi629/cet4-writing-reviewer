@@ -10,7 +10,6 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "selftest": "tsc scripts/selftest.ts --outDir .selftest-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node && node .selftest-build/scripts/selftest.js",
     "db:build": "tsc scripts/db/init.ts scripts/db/smoke.ts scripts/db/walkthrough.ts --outDir .db-build --module commonjs --target ES2022 --moduleResolution node --esModuleInterop --skipLibCheck --lib es2022,dom --types node",

@@ -34,17 +34,40 @@ export function UpgradePlan({ plan }: { plan: UpgradeAction[] }) {
           <p className="up-action">{a.action}</p>
           <p className="up-rationale">{a.rationale}</p>
 
-          {a.example && (
-            <div className="example">
-              <div className="example-row">
-                <span className="example-tag example-before">原</span>
-                <span>{a.example.before}</span>
+          {a.example ? (
+            <>
+              <div className="example">
+                <div className="example-row">
+                  <span className="example-tag example-before">原</span>
+                  <span>{a.example.before}</span>
+                </div>
+                <div className="example-row">
+                  <span className="example-tag example-after">改</span>
+                  <span>{a.example.after}</span>
+                </div>
               </div>
-              <div className="example-row">
-                <span className="example-tag example-after">改</span>
-                <span>{a.example.after}</span>
-              </div>
-            </div>
+              {/*
+                示范里的"原句"没能在原文中定位到，说明模型很可能自己写了一句
+                原文里没有的话。必须说出来——不说的话，这份示范看起来和真的一样，
+                学生照着一条不存在的"原句"去对照，只会更困惑。
+                和证据坐标同一个哲学：抄错要能被抓到，而不是装作成功。
+              */}
+              {a.exampleUnverified && (
+                <p className="example-flag">
+                  上面那个「原句」没能在原文中逐字找到，模型可能自己造了句子——请以原文为准。
+                </p>
+              )}
+            </>
+          ) : (
+            /*
+              没有示范时**不能留白**：留白和"渲染坏了"长得一模一样。
+              但也要说清楚这不是错误，所以用中性配色（.example-flag-quiet）。
+            */
+            <p className="example-flag example-flag-quiet">
+              {a.dimension === "organization"
+                ? "本条没有改写示范。结构类的建议有时落不到某一个句子上，照上面那句话做即可。"
+                : "本条没有改写示范，模型这次没能给出可照抄的句子——建议按上面那句话自己动手改一遍。"}
+            </p>
           )}
         </div>
       ))}
